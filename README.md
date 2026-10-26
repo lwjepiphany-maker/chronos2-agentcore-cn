@@ -37,11 +37,11 @@ python iac/prepare_data.py 门店销售数据.xlsx data/sales_daily.parquet
 LLM_API_KEY='sk_xxx' bash iac/deploy.sh https://github.com/<you>/chronos2-agentcore-cn.git data/sales_daily.parquet
 ```
 
-可选环境变量：`WEIGHTS_URL`（模型权重的 GitHub Release 地址，默认从 ModelScope 下载）、`STORE_CITY`（默认西安）、
+可选环境变量：`WEIGHTS_URL`（模型权重下载地址前缀，默认 ModelScope 直链；也可指向 GitHub Release）、`STORE_CITY`（默认西安）、
 `LLM_BASE_URL` / `LLM_MODEL`、`IMAGE_TAG`（改动后重新部署即滚动升级）、`GITHUB_TOKEN`（私有仓库）。
 
 模型权重（约 480 MB）不放在 git 里。两种来源：
-1. 默认：CodeBuild 从 ModelScope `amazon/chronos-2` 下载（境内，快）
+1. 默认：CodeBuild 从 ModelScope `amazon/chronos-2` 直链下载（境内，快）
 2. 可选：放到本仓库的 GitHub Release（`model.safetensors`、`config.json`、`configuration.json` 三个文件），把 Release 的下载地址前缀传给 `WEIGHTS_URL`
 
 ## 使用

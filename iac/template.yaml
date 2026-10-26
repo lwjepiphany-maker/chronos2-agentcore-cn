@@ -25,10 +25,11 @@ Parameters:
     Description: Personal access token for a private repo; leave "none" for public repos
   ModelWeightsBaseUrl:
     Type: String
-    Default: ""
+    Default: https://www.modelscope.cn/models/amazon/chronos-2/resolve/master
     Description: >-
-      Base URL holding model.safetensors / config.json / configuration.json (e.g. a GitHub Release
-      https://github.com/<user>/<repo>/releases/download/weights-v1). Empty = download from ModelScope.
+      Base URL holding model.safetensors / config.json / configuration.json. Default is the ModelScope
+      mirror of amazon/chronos-2 (fast inside China); a GitHub Release works too
+      (https://github.com/<user>/<repo>/releases/download/weights-v1).
   ImageTag:
     Type: String
     Default: v1
@@ -194,13 +195,12 @@ Resources:
 
                   echo "==> model weights"
                   mkdir -p model
-                  if [ -n "$WEIGHTS_URL" ]; then
-                    for f in model.safetensors config.json configuration.json; do curl -fsSL --retry 3 -o "model/$f" "$WEIGHTS_URL/$f"; done
-                  else
-                    pip3 install -q -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple modelscope
-                    python3 -c "from modelscope import snapshot_download; import shutil,os; d=snapshot_download('amazon/chronos-2'); [shutil.copy(os.path.join(d,f),'model/') for f in ('model.safetensors','config.json','configuration.json')]"
-                  fi
+                  for f in model.safetensors config.json configuration.json; do
+                    curl -fsSL --retry 3 --retry-delay 5 -o "model/$f" "$WEIGHTS_URL/$f"
+                  done
                   ls -la model
+                  # 权重文件应为 ~478MB；小于 400MB 说明下载到了错误页面
+                  [ "$(stat -c %s model/model.safetensors)" -gt 400000000 ] || { echo "model.safetensors too small, download failed"; false; }
 
                   echo "==> build & push images (native arm64)"
                   aws ecr get-login-password | docker login --username AWS --password-stdin "${CHRONOS_REPO_URI%%/*}"
