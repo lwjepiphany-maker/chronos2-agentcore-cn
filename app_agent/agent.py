@@ -62,10 +62,6 @@ def _load_sales() -> pd.DataFrame:
     return df
 
 
-SALES = _load_sales()
-LAST_DATE = SALES.date.max()
-
-
 def _latest_window(dates: pd.Series) -> pd.DatetimeIndex:
     """客户数据是分段的（如 2025 春季 + 2026 春季），只取最后一段连续日期，避免把中间的空档补成 0 销量。"""
     d = pd.Series(sorted(dates.unique()))
@@ -73,8 +69,31 @@ def _latest_window(dates: pd.Series) -> pd.DatetimeIndex:
     return pd.DatetimeIndex(d.iloc[breaks[-1]:].values)
 
 
-ALL_DAYS = _latest_window(SALES.date)
-logger.info(f"latest contiguous window {ALL_DAYS[0].date()} ~ {ALL_DAYS[-1].date()} ({len(ALL_DAYS)} days)")
+class _Data:
+    """销售数据延迟加载：数据文件可能在 Runtime 创建之后才上传（IaC 先建栈再传数据），
+    启动时读不到不能让进程退出，否则 Runtime 创建失败；改为首次使用时加载，失败则工具返回提示。"""
+    df: pd.DataFrame | None = None
+    last_date: pd.Timestamp | None = None
+    days: pd.DatetimeIndex | None = None
+    _lock = threading.Lock()
+
+    @classmethod
+    def ensure(cls) -> pd.DataFrame:
+        with cls._lock:
+            if cls.df is None:
+                try:
+                    df = _load_sales()
+                except Exception as e:  # noqa: BLE001
+                    raise RuntimeError(f"销售数据未就位，请先上传 {DATA_URI}（{type(e).__name__}）") from e
+                cls.df, cls.last_date, cls.days = df, df.date.max(), _latest_window(df.date)
+                logger.info(f"latest contiguous window {cls.days[0].date()} ~ {cls.days[-1].date()} ({len(cls.days)} days)")
+            return cls.df
+
+
+try:
+    _Data.ensure()
+except Exception as e:  # noqa: BLE001  数据未就位时不退出，工具调用时再试
+    logger.warning(f"sales data not loaded at startup ({e}); will retry on first tool call")
 # 门店所在城市（用于取天气）。按客户数据里的历史气温与 Open-Meteo 实况比对，西安匹配度最高（相关 0.99，误差 1℃）
 STORE_CITY = json.loads(os.environ.get("STORE_CITY_JSON", "{}"))
 DEFAULT_CITY = os.environ.get("DEFAULT_CITY", "西安")
@@ -82,16 +101,23 @@ DEFAULT_CITY = os.environ.get("DEFAULT_CITY", "西安")
 
 def _daily_series(store: int, sku: int, n_days: int) -> pd.Series:
     """门店-商品的日销量（窗口内无销售记录的日期补 0），取最近 n_days 天（不超过最后一段连续窗口）。"""
+    SALES = _Data.ensure()
     s = (SALES[(SALES.store == store) & (SALES.sku == sku)]
-         .groupby("date")["qty"].sum().reindex(ALL_DAYS, fill_value=0.0))
+         .groupby("date")["qty"].sum().reindex(_Data.days, fill_value=0.0))
     return s.iloc[-n_days:]
 
 
 def _store_weather(store: int, index: pd.DatetimeIndex) -> pd.DataFrame:
     """门店级逐日天气（来自销售数据的天气/气温列），缺失日前向填充。"""
+    SALES = _Data.ensure()
     w = (SALES[SALES.store == store].drop_duplicates("date").set_index("date")[["weather", "temp_low", "temp_high"]]
          .reindex(index).ffill().bfill())
     return w
+
+
+def _last_date() -> pd.Timestamp:
+    _Data.ensure()
+    return _Data.last_date
 
 
 # --- Chronos-2 MCP（Runtime②），用本 Runtime 执行角色的凭证做 SigV4 ---
@@ -156,12 +182,12 @@ def forecast_sku(store: int, sku: int, days: int = 7, history_days: int = 60) ->
     if hist.sum() == 0:
         return {"error": f"门店 {store} 商品 {sku} 最近 {history_days} 天没有销售记录"}
     fc = _chronos_forecast(hist.tolist(), days)
-    dates = pd.date_range(LAST_DATE + pd.Timedelta(days=1), periods=days, freq="D")
+    dates = pd.date_range(_last_date() + pd.Timedelta(days=1), periods=days, freq="D")
     rows = [{"date": d.strftime("%Y-%m-%d"), "weekday": "一二三四五六日"[d.weekday()],
              "p10": round(fc["0.1"][i], 1), "p50": round(fc["0.5"][i], 1), "p90": round(fc["0.9"][i], 1)}
             for i, d in enumerate(dates)]
     return {
-        "store": store, "sku": sku, "data_last_date": LAST_DATE.strftime("%Y-%m-%d"),
+        "store": store, "sku": sku, "data_last_date": _last_date().strftime("%Y-%m-%d"),
         "history_summary": {"days": history_days, "total": round(float(hist.sum()), 1),
                             "daily_avg": round(float(hist.mean()), 2),
                             "last_7_days": [round(float(x), 1) for x in hist.iloc[-7:]]},
@@ -189,7 +215,7 @@ def forecast_sku_with_weather(store: int, sku: int, days: int = 7, history_days:
     if hist.sum() == 0:
         return {"error": f"门店 {store} 商品 {sku} 最近 {history_days} 天没有销售记录"}
     past_w = _store_weather(store, hist.index)
-    fut_idx = pd.date_range(LAST_DATE + pd.Timedelta(days=1), periods=days, freq="D")
+    fut_idx = pd.date_range(_last_date() + pd.Timedelta(days=1), periods=days, freq="D")
     fut_w = _weather_days(city, fut_idx[0], fut_idx[-1])
     if len(fut_w) < days:
         return {"error": f"只拿到 {len(fut_w)} 天天气（Open-Meteo 预报最多未来 16 天）"}
@@ -206,7 +232,7 @@ def forecast_sku_with_weather(store: int, sku: int, days: int = 7, history_days:
              "weather": fut_cov["weather"][i], "temp": f"{fut_cov['temp_low'][i]:.0f}~{fut_cov['temp_high'][i]:.0f}℃",
              "p10": round(fc["0.1"][i], 1), "p50": round(fc["0.5"][i], 1), "p90": round(fc["0.9"][i], 1),
              "baseline_p50": round(base["0.5"][i], 1)} for i, d in enumerate(fut_idx)]
-    return {"store": store, "sku": sku, "city": city, "data_last_date": LAST_DATE.strftime("%Y-%m-%d"),
+    return {"store": store, "sku": sku, "city": city, "data_last_date": _last_date().strftime("%Y-%m-%d"),
             "covariates_used": ["weather", "temp_low", "temp_high", "weekday_num"],
             "forecast": rows,
             "totals": {"with_weather_p50": round(sum(fc["0.5"]), 1), "with_weather_p90": round(sum(fc["0.9"]), 1),
@@ -222,9 +248,10 @@ def list_top_skus(store: int, n: int = 10, days: int = 30) -> dict:
         n: 返回数量
         days: 统计最近多少天
     """
-    d = SALES[(SALES.store == store) & (SALES.date > LAST_DATE - pd.Timedelta(days=days))]
+    SALES = _Data.ensure()
+    d = SALES[(SALES.store == store) & (SALES.date > _last_date() - pd.Timedelta(days=days))]
     top = d.groupby("sku")["qty"].sum().sort_values(ascending=False).head(n)
-    return {"store": store, "days": days, "data_last_date": LAST_DATE.strftime("%Y-%m-%d"),
+    return {"store": store, "days": days, "data_last_date": _last_date().strftime("%Y-%m-%d"),
             "top_skus": [{"sku": int(k), "total_qty": round(float(v), 1)} for k, v in top.items()]}
 
 
@@ -238,6 +265,7 @@ def recent_sales(store: int, sku: int, days: int = 14) -> dict:
         days: 最近多少天
     """
     s = _daily_series(store, sku, days)
+    SALES = _Data.ensure()
     wx = (SALES[SALES.store == store].drop_duplicates("date").set_index("date")
           .reindex(s.index)[["weather", "temp_low", "temp_high"]])
     return {"store": store, "sku": sku, "daily": [
@@ -314,7 +342,7 @@ def plot_forecast(store: int, sku: int, days: int = 7, history_days: int = 30) -
     if hist.sum() == 0:
         return {"error": f"门店 {store} 商品 {sku} 最近 {history_days} 天没有销售记录"}
     fc = _chronos_forecast(_daily_series(store, sku, 60).tolist(), days)
-    fut = pd.date_range(LAST_DATE + pd.Timedelta(days=1), periods=days, freq="D")
+    fut = pd.date_range(_last_date() + pd.Timedelta(days=1), periods=days, freq="D")
     payload = {"hist_dates": [d.strftime("%m-%d") for d in hist.index], "hist": [float(x) for x in hist],
                "fut_dates": [d.strftime("%m-%d") for d in fut],
                "p10": fc["0.1"], "p50": fc["0.5"], "p90": fc["0.9"], "title": f"Store {store} / SKU {sku}"}
@@ -350,7 +378,7 @@ plt.savefig('{fname}', dpi=100); print('ok')
 
 SYSTEM_PROMPT = f"""你是便利店连锁的补货助手，服务门店运营人员。
 你可以调用工具查询门店-商品的历史销量，并用 Chronos-2 模型预测未来销量。
-数据范围：门店 1~6，日销量数据截止到 {LAST_DATE.strftime('%Y-%m-%d')}，"下周"/"未来7天"指数据截止日之后的 7 天。
+数据范围：门店 1~6，日销量数据截止到 {{last_date}}，"下周"/"未来7天"指数据截止日之后的 7 天。
 回答要求：
 - 不要自己猜销量，一律调用 forecast_sku 获取预测；用户关心天气影响时用 forecast_sku_with_weather（会同时给出不带天气的基线）。
 - 门店位于{DEFAULT_CITY}。查天气用 daily_weather（Open-Meteo），不要编造天气。
@@ -390,10 +418,14 @@ def _get_agent() -> Agent:
         model = OpenAIModel(client_args={"api_key": _get_api_key(), "base_url": LLM_BASE_URL},
                             model_id=LLM_MODEL, params={"max_tokens": 2000, "temperature": 0.2})
         # 天气 MCP 的 daily_weather / geocode 直接暴露给 LLM，便于回答"下周西安天气怎样"类问题
+        try:
+            last_date = _last_date().strftime("%Y-%m-%d")
+        except Exception as e:  # noqa: BLE001
+            last_date = f"未知（销售数据尚未上传到 {DATA_URI}：{e}）"
         _agent = Agent(model=model,
                        tools=[forecast_sku, forecast_sku_with_weather, list_top_skus, recent_sales,
                               run_python, plot_forecast] + weather.list_tools_sync(),
-                       system_prompt=SYSTEM_PROMPT, callback_handler=None)
+                       system_prompt=SYSTEM_PROMPT.replace("{last_date}", last_date), callback_handler=None)
     return _agent
 
 
