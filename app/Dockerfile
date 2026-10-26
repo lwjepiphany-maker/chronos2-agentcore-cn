@@ -4,10 +4,10 @@ FROM public.ecr.aws/docker/library/python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PIP_DEFAULT_TIMEOUT=120 PIP_RETRIES=5 MODEL_DIR=/opt/model
 
-# torch 用 PyTorch 官方 CPU 索引（避免 CUDA 依赖把镜像撑过 2GB），其依赖和其余包走境内镜像，pypi.org 兜底
+# torch 用 PyTorch 官方 CPU 索引（避免 CUDA 依赖把镜像撑过 2GB），其依赖和其余包只走境内镜像（阿里云主、腾讯云备）
 COPY app/requirements.txt /tmp/requirements.txt
 RUN pip install --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://mirrors.aliyun.com/pypi/simple torch==2.14.1 && \
-    pip install --index-url https://mirrors.aliyun.com/pypi/simple --extra-index-url https://mirrors.cloud.tencent.com/pypi/simple --extra-index-url https://pypi.org/simple -r /tmp/requirements.txt
+    pip install --index-url https://mirrors.aliyun.com/pypi/simple --extra-index-url https://mirrors.cloud.tencent.com/pypi/simple -r /tmp/requirements.txt
 
 # 模型权重打进镜像（ModelScope amazon/chronos-2），运行时不依赖外网
 COPY model/ /opt/model/
