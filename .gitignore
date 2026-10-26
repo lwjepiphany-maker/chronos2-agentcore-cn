@@ -1,0 +1,8 @@
+.venv
+model/
+data/
+*.parquet
+*.xlsx
+results_*.json
+__pycache__/
+.DS_Store
