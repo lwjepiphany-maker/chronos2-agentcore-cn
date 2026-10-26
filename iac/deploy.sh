@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # 一键部署：CloudFormation 建栈（含 CodeBuild 构建镜像）→ 上传销售数据 → 打印调用信息
-# 用法：LLM_API_KEY=sk_xxx bash iac/deploy.sh <GitRepoUrl> <sales_daily.parquet> [stack-name]
+# 用法：LLM_API_KEY=sk_xxx bash iac/deploy.sh <GitRepoUrl 或 s3://bucket/src.zip> <sales_daily.parquet> [stack-name]
 # 可选环境变量：AWS_REGION(默认 cn-northwest-1) GIT_REF(main) WEIGHTS_URL IMAGE_TAG(v1) PREFIX(chronos2) STORE_CITY(西安)
 #               LLM_BASE_URL LLM_MODEL GITHUB_TOKEN(私有仓库)
 set -euo pipefail
 cd "$(dirname "$0")/.."
-REPO_URL="${1:?GitRepoUrl}"; DATA_FILE="${2:?parquet 文件路径}"; STACK="${3:-chronos2-agentcore}"
+SRC="${1:?GitRepoUrl 或 s3://bucket/src.zip}"; DATA_FILE="${2:?parquet 文件路径}"; STACK="${3:-chronos2-agentcore}"
+# 源码来源：GitHub 地址，或离线交付时的 S3 zip（zip 内容为仓库根目录）
+if [[ "${SRC}" == s3://* ]]; then REPO_URL=""; SRC_S3="${SRC}"; else REPO_URL="${SRC}"; SRC_S3=""; fi
 : "${LLM_API_KEY:?请通过环境变量 LLM_API_KEY 传入大模型 API Key}"
 export AWS_REGION="${AWS_REGION:-cn-northwest-1}" AWS_DEFAULT_REGION="${AWS_REGION:-cn-northwest-1}"
 
@@ -13,7 +15,7 @@ echo "==> [1/3] 部署 CloudFormation 栈 ${STACK}（含镜像构建，首次约
 aws cloudformation deploy --stack-name "${STACK}" --template-file iac/template.yaml \
   --capabilities CAPABILITY_NAMED_IAM --no-fail-on-empty-changeset \
   --parameter-overrides \
-    GitRepoUrl="${REPO_URL}" GitRef="${GIT_REF:-main}" GitHubToken="${GITHUB_TOKEN:-none}" \
+    GitRepoUrl="${REPO_URL}" SourceS3Uri="${SRC_S3}" GitRef="${GIT_REF:-main}" GitHubToken="${GITHUB_TOKEN:-none}" \
     ModelWeightsBaseUrl="${WEIGHTS_URL:-}" ImageTag="${IMAGE_TAG:-v1}" RuntimeNamePrefix="${PREFIX:-chronos2}" \
     LlmApiKey="${LLM_API_KEY}" LlmBaseUrl="${LLM_BASE_URL:-https://api.ppinfra.com/v3/openai}" \
     LlmModel="${LLM_MODEL:-deepseek/deepseek-v4-flash-0731}" StoreCity="${STORE_CITY:-西安}" \
