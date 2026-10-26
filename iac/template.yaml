@@ -8,7 +8,12 @@ Description: >-
 Parameters:
   GitRepoUrl:
     Type: String
-    Description: HTTPS URL of the GitHub repo containing app/, app_agent/ (e.g. https://github.com/<user>/chronos2-agentcore-cn.git)
+    Default: ""
+    Description: HTTPS URL of the Git repo containing app/, app_agent/ (e.g. https://github.com/<user>/chronos2-agentcore-cn.git). Leave empty when using SourceS3Uri.
+  SourceS3Uri:
+    Type: String
+    Default: ""
+    Description: Alternative to GitRepoUrl - s3://bucket/key.zip holding the repo contents (zip of the repo root). Used when the customer receives the package offline.
   GitRef:
     Type: String
     Default: main
@@ -125,6 +130,10 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Ref BuildSecrets
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::*/*"
+                Condition: { StringEquals: { "aws:ResourceAccount": !Ref AWS::AccountId } }
               # AgentCore Identity API-key provider (stores the key in a Secrets Manager secret it manages)
               - Effect: Allow
                 Action: [bedrock-agentcore:CreateApiKeyCredentialProvider, bedrock-agentcore:UpdateApiKeyCredentialProvider, bedrock-agentcore:GetApiKeyCredentialProvider, bedrock-agentcore:DeleteApiKeyCredentialProvider, bedrock-agentcore:CreateTokenVault, bedrock-agentcore:GetTokenVault]
@@ -169,10 +178,19 @@ Resources:
                     exit 0
                   fi
 
-                  echo "==> clone $REPO_URL@$GIT_REF"
-                  CLONE_URL="$REPO_URL"
-                  [ "$GITHUB_TOKEN" != "none" ] && CLONE_URL=$(echo "$REPO_URL" | sed "s#https://#https://${GITHUB_TOKEN}@#")
-                  git clone --depth 1 --branch "$GIT_REF" "$CLONE_URL" src && cd src
+                  if [ -n "$SOURCE_S3_URI" ]; then
+                    echo "==> fetch source zip $SOURCE_S3_URI"
+                    aws s3 cp "$SOURCE_S3_URI" /tmp/src.zip --only-show-errors
+                    mkdir -p src && unzip -q /tmp/src.zip -d src
+                    # zip 可能带一层顶级目录
+                    [ -f src/app/Dockerfile ] || { d=$(find src -mindepth 1 -maxdepth 1 -type d | head -1); mv "$d"/* "$d"/.[!.]* src/ 2>/dev/null || true; }
+                    cd src
+                  else
+                    echo "==> clone $REPO_URL@$GIT_REF"
+                    CLONE_URL="$REPO_URL"
+                    [ "$GITHUB_TOKEN" != "none" ] && CLONE_URL=$(echo "$REPO_URL" | sed "s#https://#https://${GITHUB_TOKEN}@#")
+                    git clone --depth 1 --branch "$GIT_REF" "$CLONE_URL" src && cd src
+                  fi
 
                   echo "==> model weights"
                   mkdir -p model
@@ -217,6 +235,7 @@ Resources:
         EnvironmentVariables:
           - { Name: MODE, Value: build }
           - { Name: REPO_URL, Value: !Ref GitRepoUrl }
+          - { Name: SOURCE_S3_URI, Value: !Ref SourceS3Uri }
           - { Name: GIT_REF, Value: !Ref GitRef }
           - { Name: WEIGHTS_URL, Value: !Ref ModelWeightsBaseUrl }
           - { Name: IMAGE_TAG, Value: !Ref ImageTag }
@@ -308,6 +327,7 @@ Resources:
       ImageTag: !Ref ImageTag
       GitRef: !Ref GitRef
       GitRepoUrl: !Ref GitRepoUrl
+      SourceS3Uri: !Ref SourceS3Uri
       ModelWeightsBaseUrl: !Ref ModelWeightsBaseUrl
 
   # ------------------------------------------------------------------ runtime roles (least privilege)
