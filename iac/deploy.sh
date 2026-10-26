@@ -16,7 +16,7 @@ aws cloudformation deploy --stack-name "${STACK}" --template-file iac/template.y
   --capabilities CAPABILITY_NAMED_IAM --no-fail-on-empty-changeset \
   --parameter-overrides \
     GitRepoUrl="${REPO_URL}" SourceS3Uri="${SRC_S3}" GitRef="${GIT_REF:-main}" GitHubToken="${GITHUB_TOKEN:-none}" \
-    ModelWeightsBaseUrl="${WEIGHTS_URL:-}" ImageTag="${IMAGE_TAG:-v1}" RuntimeNamePrefix="${PREFIX:-chronos2}" \
+    ModelWeightsBaseUrl="${WEIGHTS_URL:-https://www.modelscope.cn/models/amazon/chronos-2/resolve/master}" ImageTag="${IMAGE_TAG:-v1}" RuntimeNamePrefix="${PREFIX:-chronos2}" \
     LlmApiKey="${LLM_API_KEY}" LlmBaseUrl="${LLM_BASE_URL:-https://api.ppinfra.com/v3/openai}" \
     LlmModel="${LLM_MODEL:-deepseek/deepseek-v4-flash-0731}" StoreCity="${STORE_CITY:-西安}" \
     IdleTimeoutSeconds="${IDLE_TIMEOUT:-600}"
