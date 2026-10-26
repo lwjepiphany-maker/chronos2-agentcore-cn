@@ -126,7 +126,7 @@ Resources:
                 Action: ecr:GetAuthorizationToken
                 Resource: "*"
               - Effect: Allow
-                Action: [ecr:BatchCheckLayerAvailability, ecr:CompleteLayerUpload, ecr:InitiateLayerUpload, ecr:PutImage, ecr:UploadLayerPart, ecr:BatchGetImage, ecr:GetDownloadUrlForLayer]
+                Action: [ecr:BatchCheckLayerAvailability, ecr:CompleteLayerUpload, ecr:InitiateLayerUpload, ecr:PutImage, ecr:UploadLayerPart, ecr:BatchGetImage, ecr:GetDownloadUrlForLayer, ecr:DescribeImages]
                 Resource: [!GetAtt ChronosRepo.Arn, !GetAtt AgentRepo.Arn]
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
@@ -204,12 +204,13 @@ Resources:
                   # 权重文件应为 ~478MB；小于 400MB 说明下载到了错误页面
                   [ "$(stat -c %s model/model.safetensors)" -gt 400000000 ] || { echo "model.safetensors too small, download failed"; false; }
 
-                  echo "==> build & push images (native arm64)"
+                  echo "==> build & push images (native arm64); skip an image whose tag already exists in ECR"
                   aws ecr get-login-password | docker login --username AWS --password-stdin "${CHRONOS_REPO_URI%%/*}"
-                  docker build -f app/Dockerfile -t "$CHRONOS_REPO_URI:$IMAGE_TAG" .
-                  docker push "$CHRONOS_REPO_URI:$IMAGE_TAG"
-                  docker build -f app_agent/Dockerfile -t "$AGENT_REPO_URI:$IMAGE_TAG" .
-                  docker push "$AGENT_REPO_URI:$IMAGE_TAG"
+                  image_exists() { aws ecr describe-images --repository-name "$1" --image-ids imageTag="$IMAGE_TAG" >/dev/null 2>&1; }
+                  if image_exists "${CHRONOS_REPO_URI##*/}"; then echo "forecast image $IMAGE_TAG already in ECR, skipping"; else
+                    docker build -f app/Dockerfile -t "$CHRONOS_REPO_URI:$IMAGE_TAG" . && docker push "$CHRONOS_REPO_URI:$IMAGE_TAG"; fi
+                  if image_exists "${AGENT_REPO_URI##*/}"; then echo "agent image $IMAGE_TAG already in ECR, skipping"; else
+                    docker build -f app_agent/Dockerfile -t "$AGENT_REPO_URI:$IMAGE_TAG" . && docker push "$AGENT_REPO_URI:$IMAGE_TAG"; fi
 
                   echo "==> LLM API key -> AgentCore Identity provider $PROVIDER_NAME"
                   if aws bedrock-agentcore-control get-api-key-credential-provider --name "$PROVIDER_NAME" >/dev/null 2>&1; then
@@ -269,6 +270,9 @@ Resources:
                 Action: codebuild:StartBuild
                 Resource: !GetAtt BuildProject.Arn
               - Effect: Allow
+                Action: ecr:DescribeImages
+                Resource: [!GetAtt ChronosRepo.Arn, !GetAtt AgentRepo.Arn]
+              - Effect: Allow
                 Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
                 Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}*"
 
@@ -283,6 +287,7 @@ Resources:
       Environment:
         Variables:
           PROJECT_NAME: !Ref BuildProject
+          REPOS: !Sub "${ChronosRepo},${AgentRepo}"
       Code:
         ZipFile: |
           import json, os, urllib.request, boto3
@@ -314,6 +319,17 @@ Resources:
                       respond(event, "SUCCESS")
                       return
                   props = event["ResourceProperties"]
+                  ecr = boto3.client("ecr")
+                  def exists(repo):
+                      try:
+                          ecr.describe_images(repositoryName=repo, imageIds=[{"imageTag": props["ImageTag"]}])
+                          return True
+                      except ecr.exceptions.ImageNotFoundException:
+                          return False
+                  if all(exists(r) for r in os.environ["REPOS"].split(",")):
+                      print("images already exist for tag", props["ImageTag"], "- skipping build")
+                      respond(event, "SUCCESS", "images already present")
+                      return
                   cb.start_build(projectName=os.environ["PROJECT_NAME"],
                                  environmentVariablesOverride=env("build") + [
                                      {"name": "IMAGE_TAG", "value": props["ImageTag"], "type": "PLAINTEXT"},
