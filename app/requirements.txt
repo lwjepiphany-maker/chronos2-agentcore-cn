@@ -1,0 +1,2 @@
+chronos-forecasting==2.3.2
+mcp==1.30.0

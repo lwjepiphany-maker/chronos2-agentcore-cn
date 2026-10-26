@@ -1,0 +1,419 @@
+"""销量预测 Agent，运行在 Amazon Bedrock AgentCore Runtime（HTTP 协议）。
+
+架构：
+  用户 → Runtime①(本 Agent, Strands) → LLM(PPIO DeepSeek, OpenAI 兼容接口)
+                                     → Runtime②(Chronos-2 MCP, SigV4) 做预测
+                                     → S3 parquet 读历史销量
+
+设计要点：
+- 工具 forecast_sku 在内部取数并调用 Chronos，LLM 只拿到结论，不搬运历史销量数组。
+- LLM API Key 通过 AgentCore Identity 的 API Key credential provider 获取（本地调试可用 PPIO_API_KEY 环境变量）。
+- Runtime 每个会话一个 microVM，进程内的 Agent 对象即会话记忆（中国区无 AgentCore Memory）。
+"""
+import ast
+import base64
+import io
+import json
+import logging
+import os
+import sys
+import threading
+import time
+import urllib.parse
+import uuid
+
+import boto3
+import pandas as pd
+from bedrock_agentcore.runtime import BedrockAgentCoreApp
+from bedrock_agentcore.tools.code_interpreter_client import CodeInterpreter
+from mcp_proxy_for_aws.client import aws_iam_streamablehttp_client
+from strands import Agent, tool
+from strands.models.openai import OpenAIModel
+from strands.tools.mcp import MCPClient
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("chronos2-agent")
+
+REGION = os.environ.get("AWS_REGION", "cn-northwest-1")
+CHRONOS_RUNTIME_ARN = os.environ["CHRONOS_RUNTIME_ARN"]
+DATA_URI = os.environ.get("DATA_URI", "data/sales_daily.parquet")  # s3://bucket/key 或本地路径
+API_KEY_PROVIDER = os.environ.get("API_KEY_PROVIDER", "ppio-deepseek")
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.ppinfra.com/v3/openai")
+LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek/deepseek-v4-flash-0731")
+# Code Interpreter 生成的图表存到这个私有桶前缀（不走预签名 URL，前端用 IAM 读取）
+CHART_BUCKET = os.environ.get("CHART_BUCKET", "")
+CHART_PREFIX = os.environ.get("CHART_PREFIX", "chronos2-agent-poc/charts/")
+
+app = BedrockAgentCoreApp()
+
+
+# --- 数据：启动时整表读入内存（481k 行 / 约 5MB parquet），按门店+商品过滤 ---
+
+def _load_sales() -> pd.DataFrame:
+    t0 = time.time()
+    if DATA_URI.startswith("s3://"):
+        bucket, key = DATA_URI[5:].split("/", 1)
+        body = boto3.client("s3", region_name=REGION).get_object(Bucket=bucket, Key=key)["Body"].read()
+        df = pd.read_parquet(io.BytesIO(body))
+    else:
+        df = pd.read_parquet(DATA_URI)
+    logger.info(f"sales data loaded rows={len(df)} range={df.date.min().date()}~{df.date.max().date()} "
+                f"in {time.time() - t0:.2f}s")
+    return df
+
+
+SALES = _load_sales()
+LAST_DATE = SALES.date.max()
+
+
+def _latest_window(dates: pd.Series) -> pd.DatetimeIndex:
+    """客户数据是分段的（如 2025 春季 + 2026 春季），只取最后一段连续日期，避免把中间的空档补成 0 销量。"""
+    d = pd.Series(sorted(dates.unique()))
+    breaks = d[d.diff() != pd.Timedelta(days=1)].index
+    return pd.DatetimeIndex(d.iloc[breaks[-1]:].values)
+
+
+ALL_DAYS = _latest_window(SALES.date)
+logger.info(f"latest contiguous window {ALL_DAYS[0].date()} ~ {ALL_DAYS[-1].date()} ({len(ALL_DAYS)} days)")
+# 门店所在城市（用于取天气）。按客户数据里的历史气温与 Open-Meteo 实况比对，西安匹配度最高（相关 0.99，误差 1℃）
+STORE_CITY = json.loads(os.environ.get("STORE_CITY_JSON", "{}"))
+DEFAULT_CITY = os.environ.get("DEFAULT_CITY", "西安")
+
+
+def _daily_series(store: int, sku: int, n_days: int) -> pd.Series:
+    """门店-商品的日销量（窗口内无销售记录的日期补 0），取最近 n_days 天（不超过最后一段连续窗口）。"""
+    s = (SALES[(SALES.store == store) & (SALES.sku == sku)]
+         .groupby("date")["qty"].sum().reindex(ALL_DAYS, fill_value=0.0))
+    return s.iloc[-n_days:]
+
+
+def _store_weather(store: int, index: pd.DatetimeIndex) -> pd.DataFrame:
+    """门店级逐日天气（来自销售数据的天气/气温列），缺失日前向填充。"""
+    w = (SALES[SALES.store == store].drop_duplicates("date").set_index("date")[["weather", "temp_low", "temp_high"]]
+         .reindex(index).ffill().bfill())
+    return w
+
+
+# --- Chronos-2 MCP（Runtime②），用本 Runtime 执行角色的凭证做 SigV4 ---
+
+def _chronos_url():
+    return (f"https://bedrock-agentcore.{REGION}.amazonaws.com.cn/runtimes/"
+            f"{urllib.parse.quote(CHRONOS_RUNTIME_ARN, safe='')}/invocations?qualifier=DEFAULT")
+
+
+chronos = MCPClient(lambda: aws_iam_streamablehttp_client(
+    endpoint=_chronos_url(), aws_region=REGION, aws_service="bedrock-agentcore"), startup_timeout=60)
+
+
+def _chronos_call(tool: str, arguments: dict) -> dict:
+    t0 = time.time()
+    res = chronos.call_tool_sync(tool_use_id=f"fc-{uuid.uuid4().hex[:8]}", name=tool, arguments=arguments)
+    if res["status"] != "success":
+        raise RuntimeError(f"chronos error: {res['content']}")
+    out = res.get("structuredContent") or json.loads(res["content"][0]["text"])
+    out = out.get("result", out)
+    logger.info(f"chronos {tool} days={arguments.get('prediction_length')} latency_ms={(time.time() - t0) * 1000:.0f}")
+    return out
+
+
+def _chronos_forecast(history: list[float], days: int) -> dict:
+    return _chronos_call("forecast", {"history": history, "prediction_length": days})
+
+
+# --- Open-Meteo 天气 MCP（stdio 子进程，见 weather_mcp.py），为预测提供未来天气协变量 ---
+
+from mcp import StdioServerParameters  # noqa: E402
+from mcp.client.stdio import stdio_client  # noqa: E402
+
+WEATHER_MCP = os.environ.get("WEATHER_MCP_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "weather_mcp.py"))
+weather = MCPClient(lambda: stdio_client(StdioServerParameters(command=sys.executable, args=[WEATHER_MCP])),
+                    startup_timeout=60)
+
+
+def _weather_days(city: str, start: pd.Timestamp, end: pd.Timestamp) -> list[dict]:
+    res = weather.call_tool_sync(tool_use_id=f"wx-{uuid.uuid4().hex[:8]}", name="daily_weather",
+                                 arguments={"city": city, "start_date": start.strftime("%Y-%m-%d"),
+                                            "end_date": end.strftime("%Y-%m-%d")})
+    if res["status"] != "success":
+        raise RuntimeError(f"weather error: {res['content']}")
+    out = res.get("structuredContent") or json.loads(res["content"][0]["text"])
+    return out.get("result", out)["days"]
+
+
+# --- 暴露给 LLM 的工具（返回精简 JSON，不返回原始长数组） ---
+
+@tool
+def forecast_sku(store: int, sku: int, days: int = 7, history_days: int = 60) -> dict:
+    """预测某门店某商品未来 days 天的日销量，并给出补货建议。
+
+    Args:
+        store: 门店代码（1~6）
+        sku: 商品代码
+        days: 预测天数，默认 7
+        history_days: 用多少天历史做预测，默认 60
+    """
+    hist = _daily_series(store, sku, history_days)
+    if hist.sum() == 0:
+        return {"error": f"门店 {store} 商品 {sku} 最近 {history_days} 天没有销售记录"}
+    fc = _chronos_forecast(hist.tolist(), days)
+    dates = pd.date_range(LAST_DATE + pd.Timedelta(days=1), periods=days, freq="D")
+    rows = [{"date": d.strftime("%Y-%m-%d"), "weekday": "一二三四五六日"[d.weekday()],
+             "p10": round(fc["0.1"][i], 1), "p50": round(fc["0.5"][i], 1), "p90": round(fc["0.9"][i], 1)}
+            for i, d in enumerate(dates)]
+    return {
+        "store": store, "sku": sku, "data_last_date": LAST_DATE.strftime("%Y-%m-%d"),
+        "history_summary": {"days": history_days, "total": round(float(hist.sum()), 1),
+                            "daily_avg": round(float(hist.mean()), 2),
+                            "last_7_days": [round(float(x), 1) for x in hist.iloc[-7:]]},
+        "forecast": rows,
+        "suggestion": {"expected_total_p50": round(sum(r["p50"] for r in rows), 1),
+                       "safety_total_p90": round(sum(r["p90"] for r in rows), 1)},
+    }
+
+
+@tool
+def forecast_sku_with_weather(store: int, sku: int, days: int = 7, history_days: int = 60,
+                              city: str | None = None) -> dict:
+    """带天气协变量的销量预测：用 Open-Meteo 取门店所在城市未来 days 天的天气/气温，连同历史天气一起输入 Chronos-2，
+    并与不带天气的基线预测对比。用户关心天气影响、或问"下周下雨销量会怎样"时调用。
+
+    Args:
+        store: 门店代码（1~6）
+        sku: 商品代码
+        days: 预测天数，默认 7
+        history_days: 历史窗口天数，默认 60
+        city: 城市名，默认取门店配置（西安）
+    """
+    city = city or STORE_CITY.get(str(store), DEFAULT_CITY)
+    hist = _daily_series(store, sku, history_days)
+    if hist.sum() == 0:
+        return {"error": f"门店 {store} 商品 {sku} 最近 {history_days} 天没有销售记录"}
+    past_w = _store_weather(store, hist.index)
+    fut_idx = pd.date_range(LAST_DATE + pd.Timedelta(days=1), periods=days, freq="D")
+    fut_w = _weather_days(city, fut_idx[0], fut_idx[-1])
+    if len(fut_w) < days:
+        return {"error": f"只拿到 {len(fut_w)} 天天气（Open-Meteo 预报最多未来 16 天）"}
+    past_cov = {"weather": past_w.weather.astype(str).tolist(),
+                "temp_low": past_w.temp_low.astype(float).tolist(), "temp_high": past_w.temp_high.astype(float).tolist(),
+                "weekday_num": [float(d.weekday() + 1) for d in hist.index]}
+    fut_cov = {"weather": [w["weather"] or "多云" for w in fut_w],
+               "temp_low": [float(w["temp_low"]) for w in fut_w], "temp_high": [float(w["temp_high"]) for w in fut_w],
+               "weekday_num": [float(d.weekday() + 1) for d in fut_idx]}
+    fc = _chronos_call("forecast_with_covariates", {"history": hist.tolist(), "past_covariates": past_cov,
+                                                    "future_covariates": fut_cov, "prediction_length": days})
+    base = _chronos_forecast(hist.tolist(), days)
+    rows = [{"date": d.strftime("%Y-%m-%d"), "weekday": "一二三四五六日"[d.weekday()],
+             "weather": fut_cov["weather"][i], "temp": f"{fut_cov['temp_low'][i]:.0f}~{fut_cov['temp_high'][i]:.0f}℃",
+             "p10": round(fc["0.1"][i], 1), "p50": round(fc["0.5"][i], 1), "p90": round(fc["0.9"][i], 1),
+             "baseline_p50": round(base["0.5"][i], 1)} for i, d in enumerate(fut_idx)]
+    return {"store": store, "sku": sku, "city": city, "data_last_date": LAST_DATE.strftime("%Y-%m-%d"),
+            "covariates_used": ["weather", "temp_low", "temp_high", "weekday_num"],
+            "forecast": rows,
+            "totals": {"with_weather_p50": round(sum(fc["0.5"]), 1), "with_weather_p90": round(sum(fc["0.9"]), 1),
+                       "baseline_p50": round(sum(base["0.5"]), 1)}}
+
+
+@tool
+def list_top_skus(store: int, n: int = 10, days: int = 30) -> dict:
+    """列出某门店最近 days 天销量最高的 n 个商品。
+
+    Args:
+        store: 门店代码（1~6）
+        n: 返回数量
+        days: 统计最近多少天
+    """
+    d = SALES[(SALES.store == store) & (SALES.date > LAST_DATE - pd.Timedelta(days=days))]
+    top = d.groupby("sku")["qty"].sum().sort_values(ascending=False).head(n)
+    return {"store": store, "days": days, "data_last_date": LAST_DATE.strftime("%Y-%m-%d"),
+            "top_skus": [{"sku": int(k), "total_qty": round(float(v), 1)} for k, v in top.items()]}
+
+
+@tool
+def recent_sales(store: int, sku: int, days: int = 14) -> dict:
+    """查询某门店某商品最近 days 天的每日实际销量和天气。
+
+    Args:
+        store: 门店代码（1~6）
+        sku: 商品代码
+        days: 最近多少天
+    """
+    s = _daily_series(store, sku, days)
+    wx = (SALES[SALES.store == store].drop_duplicates("date").set_index("date")
+          .reindex(s.index)[["weather", "temp_low", "temp_high"]])
+    return {"store": store, "sku": sku, "daily": [
+        {"date": d.strftime("%Y-%m-%d"), "qty": round(float(q), 1), "weather": str(wx.loc[d, "weather"]),
+         "temp": f"{wx.loc[d, 'temp_low']}~{wx.loc[d, 'temp_high']}℃"} for d, q in s.items()]}
+
+
+# --- AgentCore Code Interpreter：隔离沙箱里做精确计算和画图（中国区可用） ---
+
+_ci: CodeInterpreter | None = None
+_ci_lock = threading.Lock()
+
+
+def _code_interpreter() -> CodeInterpreter:
+    """每个 Agent 会话（microVM）复用一个 Code Interpreter 会话，首次调用时启动（约 2 s）。"""
+    global _ci
+    with _ci_lock:
+        if _ci is None:
+            t0 = time.time()
+            ci = CodeInterpreter(region=REGION)
+            ci.start(session_timeout_seconds=900)
+            logger.info(f"code interpreter session {ci.session_id} started in {time.time() - t0:.2f}s")
+            _ci = ci
+    return _ci
+
+
+def _ci_result(resp) -> dict:
+    return list(resp["stream"])[0]["result"] if "stream" in resp else resp
+
+
+def _decode_blob(raw) -> bytes:
+    """readFiles 返回的二进制内容：SDK 1.24 把 bytes 转成了 repr 字符串（"b'\\x89PNG...'"），兼容三种形态。"""
+    if isinstance(raw, bytes):
+        return raw
+    if isinstance(raw, str) and raw[:2] in ("b'", 'b"'):
+        return ast.literal_eval(raw)
+    return base64.b64decode(raw)
+
+
+def _ci_exec(code: str) -> dict:
+    t0 = time.time()
+    res = _ci_result(_code_interpreter().invoke("executeCode", {"code": code, "language": "python"}))
+    sc = res.get("structuredContent") or {}
+    logger.info(f"code interpreter exec exit={sc.get('exitCode')} latency_ms={(time.time() - t0) * 1000:.0f}")
+    return {"stdout": sc.get("stdout", ""), "stderr": sc.get("stderr", ""), "exit_code": sc.get("exitCode")}
+
+
+@tool
+def run_python(code: str) -> dict:
+    """在隔离沙箱中执行 Python 代码做精确计算，用 print 输出结果。
+    适用：补货量 = P90 合计 − 现有库存 − 在途，按箱规向上取整；多商品汇总、占比、同比环比等。
+    不要用它查询销量数据，查询用 recent_sales / list_top_skus。
+
+    Args:
+        code: 要执行的 Python 代码，必须用 print 输出最终结果
+    """
+    return _ci_exec(code)
+
+
+@tool
+def plot_forecast(store: int, sku: int, days: int = 7, history_days: int = 30) -> dict:
+    """绘制某门店某商品的历史日销量与未来预测区间图（PNG），保存到 S3 并返回位置。
+    用户要求"画图 / 图表 / 可视化 / 趋势图"时调用。
+
+    Args:
+        store: 门店代码（1~6）
+        sku: 商品代码
+        days: 预测天数，默认 7
+        history_days: 图中显示最近多少天历史，默认 30
+    """
+    if not CHART_BUCKET:
+        return {"error": "未配置 CHART_BUCKET，无法保存图表"}
+    hist = _daily_series(store, sku, history_days)
+    if hist.sum() == 0:
+        return {"error": f"门店 {store} 商品 {sku} 最近 {history_days} 天没有销售记录"}
+    fc = _chronos_forecast(_daily_series(store, sku, 60).tolist(), days)
+    fut = pd.date_range(LAST_DATE + pd.Timedelta(days=1), periods=days, freq="D")
+    payload = {"hist_dates": [d.strftime("%m-%d") for d in hist.index], "hist": [float(x) for x in hist],
+               "fut_dates": [d.strftime("%m-%d") for d in fut],
+               "p10": fc["0.1"], "p50": fc["0.5"], "p90": fc["0.9"], "title": f"Store {store} / SKU {sku}"}
+    fname = f"forecast_{store}_{sku}.png"
+    # 沙箱里没有中文字体，图内文字用英文；数据通过 JSON 字面量传入
+    code = f"""
+import json, matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+d = json.loads({json.dumps(json.dumps(payload, ensure_ascii=False))})
+x_h = list(range(len(d['hist']))); x_f = list(range(len(d['hist']), len(d['hist']) + len(d['p50'])))
+plt.figure(figsize=(10, 4))
+plt.plot(x_h, d['hist'], color='#232F3E', label='Actual')
+plt.plot(x_f, d['p50'], color='#FF9900', marker='o', label='Forecast P50')
+plt.fill_between(x_f, d['p10'], d['p90'], color='#FF9900', alpha=0.2, label='P10-P90')
+ticks = x_h[::5] + x_f; labels = d['hist_dates'][::5] + d['fut_dates']
+plt.xticks(ticks, labels, rotation=45, fontsize=8)
+plt.title(d['title'] + ' daily sales forecast'); plt.ylabel('units'); plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
+plt.savefig('{fname}', dpi=100); print('ok')
+"""
+    out = _ci_exec(code)
+    if out["exit_code"] != 0:
+        return {"error": f"绘图失败: {out['stderr'][-300:]}"}
+    res = _ci_result(_code_interpreter().invoke("readFiles", {"paths": [fname]}))
+    png = _decode_blob(res["content"][0]["resource"]["blob"])
+    key = f"{CHART_PREFIX}{store}_{sku}_{uuid.uuid4().hex[:8]}.png"
+    boto3.client("s3", region_name=REGION).put_object(Bucket=CHART_BUCKET, Key=key, Body=png, ContentType="image/png")
+    logger.info(f"chart saved s3://{CHART_BUCKET}/{key} bytes={len(png)}")
+    return {"chart_s3_uri": f"s3://{CHART_BUCKET}/{key}", "size_bytes": len(png),
+            "forecast_total_p50": round(sum(fc["0.5"]), 1), "forecast_total_p90": round(sum(fc["0.9"]), 1),
+            "note": "图表已保存到私有 S3，调用方用 IAM 凭证下载后展示给用户"}
+
+
+SYSTEM_PROMPT = f"""你是便利店连锁的补货助手，服务门店运营人员。
+你可以调用工具查询门店-商品的历史销量，并用 Chronos-2 模型预测未来销量。
+数据范围：门店 1~6，日销量数据截止到 {LAST_DATE.strftime('%Y-%m-%d')}，"下周"/"未来7天"指数据截止日之后的 7 天。
+回答要求：
+- 不要自己猜销量，一律调用 forecast_sku 获取预测；用户关心天气影响时用 forecast_sku_with_weather（会同时给出不带天气的基线）。
+- 门店位于{DEFAULT_CITY}。查天气用 daily_weather（Open-Meteo），不要编造天气。
+- 涉及补货量计算（扣减库存、在途、按箱规取整）或多商品汇总时，用 run_python 精确计算，不要心算。
+- 用户要图表时调用 plot_forecast，并把返回的 S3 位置告诉用户。
+- 用中文、简洁地给出：预测的每日 P50、合计 P50（常规备货量）和 P90（安全库存上限），并简述近期销量趋势。
+- 用户只说商品名没有商品代码时，用 list_top_skus 帮用户定位，或请用户提供商品代码。
+"""
+
+
+# --- LLM：OpenAI 兼容接口（PPIO DeepSeek）。API Key 来自 AgentCore Identity，本地调试用环境变量 ---
+
+def _get_api_key() -> str:
+    if os.environ.get("PPIO_API_KEY"):
+        return os.environ["PPIO_API_KEY"]
+    from bedrock_agentcore.identity.auth import requires_api_key
+
+    @requires_api_key(provider_name=API_KEY_PROVIDER)
+    def _fetch(*, api_key: str) -> str:
+        return api_key
+
+    t0 = time.time()
+    key = _fetch()
+    logger.info(f"api key fetched from AgentCore Identity provider={API_KEY_PROVIDER} in {time.time() - t0:.2f}s")
+    return key
+
+
+_agent: Agent | None = None
+
+
+def _get_agent() -> Agent:
+    """每个会话一个 microVM，所以进程内单个 Agent 即可保存本会话的对话历史。"""
+    global _agent
+    if _agent is None:
+        chronos.start()
+        weather.start()
+        model = OpenAIModel(client_args={"api_key": _get_api_key(), "base_url": LLM_BASE_URL},
+                            model_id=LLM_MODEL, params={"max_tokens": 2000, "temperature": 0.2})
+        # 天气 MCP 的 daily_weather / geocode 直接暴露给 LLM，便于回答"下周西安天气怎样"类问题
+        _agent = Agent(model=model,
+                       tools=[forecast_sku, forecast_sku_with_weather, list_top_skus, recent_sales,
+                              run_python, plot_forecast] + weather.list_tools_sync(),
+                       system_prompt=SYSTEM_PROMPT, callback_handler=None)
+    return _agent
+
+
+@app.entrypoint
+def invoke(payload: dict, context=None) -> dict:
+    prompt = payload.get("prompt", "")
+    t0 = time.time()
+    agent = _get_agent()
+    result = agent(prompt)
+    m = result.metrics
+    tools_used = [{"tool": name, "calls": tm.call_count, "ms": round(tm.total_time * 1000)}
+                  for name, tm in m.tool_metrics.items()]
+    resp = {"result": str(result).strip(), "usage": dict(m.accumulated_usage),
+            "llm_ms": round(sum(m.accumulated_metrics.values()) if isinstance(m.accumulated_metrics, dict)
+                            else m.accumulated_metrics.get("latencyMs", 0)),
+            "tools": tools_used, "total_ms": round((time.time() - t0) * 1000),
+            "session_id": getattr(context, "session_id", None)}
+    logger.info(f"invoke done total_ms={resp['total_ms']} usage={resp['usage']} tools={tools_used}")
+    return resp
+
+
+if __name__ == "__main__":
+    app.run()

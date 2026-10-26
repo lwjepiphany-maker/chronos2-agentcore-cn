@@ -1,0 +1,8 @@
+strands-agents[openai]==1.59.0
+bedrock-agentcore==1.24.1
+mcp-proxy-for-aws==1.7.0
+aws-opentelemetry-distro
+pandas
+pyarrow
+boto3
+requests
