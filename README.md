@@ -34,22 +34,38 @@ AI 助手（Claude Code / Kiro）──mcp-proxy-for-aws──▶ Runtime②（�
 | `tests/` | 预测服务基准、Agent 对话测试、测试用例生成 |
 | `docs/` | 客户版部署方案、技术指南、销售数据格式说明、两阶段验证报告、`architecture/` 架构图（PNG + 交互式 HTML） |
 
-## 部署（约 25 分钟）
+## 部署（首次 20～30 分钟）
 
-前提：中国区账号已开通 Bedrock AgentCore；AWS CLI v2；一个 OpenAI 兼容大模型的 API Key。
+前提：中国区账号已开通 Bedrock AgentCore；部署机有 AWS CLI v2（已配置中国区凭证）和 Python 3.10+；一个 OpenAI 兼容大模型的 API Key。
 **不需要本机 Docker**，镜像由 CodeBuild 在区域内构建。
 
 ```bash
-python iac/prepare_data.py 门店销售数据.xlsx data/sales_daily.parquet   # Excel 格式要求见 docs/销售数据格式说明.md
-LLM_API_KEY='sk_xxx' bash iac/deploy.sh https://github.com/<you>/chronos2-agentcore-cn.git data/sales_daily.parquet
+# 0. 取代码，装数据转换所需的 Python 包
+git clone https://github.com/lwjepiphany-maker/chronos2-agentcore-cn.git && cd chronos2-agentcore-cn
+pip install pandas pyarrow openpyxl boto3
+
+# 1. 销售 Excel → parquet（格式要求见 docs/销售数据格式说明.md）
+python iac/prepare_data.py 门店销售数据.xlsx data/sales_daily.parquet
+
+# 2. 一键部署：建栈（含镜像构建）→ 上传数据 → 打印 Agent ARN、前端命令等
+LLM_API_KEY='sk_xxx' bash iac/deploy.sh https://github.com/lwjepiphany-maker/chronos2-agentcore-cn.git data/sales_daily.parquet
+
+# 3. 商品主数据与库存（补货功能用）。客户暂无真实数据时先生成模拟数据：
+python tools/mock_master_data.py --parquet data/sales_daily.parquet --out data/master --upload s3://<DataBucket>/master/
+#    有真实数据时：python iac/prepare_master.py 商品主数据与库存.xlsx data/master && aws s3 cp data/master/ s3://<DataBucket>/master/ --recursive
+
+# 4. 启动前端（本机或内网），<AgentRuntimeArn> / <DataBucket> 取自第 2 步输出
+pip install -r frontend/requirements.txt
+streamlit run frontend/app.py -- --agent-arn <AgentRuntimeArn> --data-bucket <DataBucket> --region cn-northwest-1
 ```
 
-可选环境变量：`WEIGHTS_URL`（模型权重下载地址前缀，默认 ModelScope 直链；也可指向 GitHub Release）、`STORE_CITY`（默认西安）、
-`LLM_BASE_URL` / `LLM_MODEL`、`IMAGE_TAG`（改动后重新部署即滚动升级）、`GITHUB_TOKEN`（私有仓库）。
+可选环境变量（第 2 步前 export）：`STORE_CITY`（门店城市，默认西安）、`LLM_BASE_URL` / `LLM_MODEL`（默认 PPIO 的 DeepSeek V4 Flash）、
+`IMAGE_TAG`（改代码后换个值重跑即滚动升级，只重建改动过的镜像，约 6 分钟）、`PREFIX`（资源名前缀，默认 chronos2）、
+`WEIGHTS_URL`（模型权重地址，默认 ModelScope 直链）、`GITHUB_TOKEN`（私有仓库）。
 
-模型权重（约 480 MB）不放在 git 里。两种来源：
-1. 默认：CodeBuild 从 ModelScope `amazon/chronos-2` 直链下载（境内，快）
-2. 可选：放到本仓库的 GitHub Release（`model.safetensors`、`config.json`、`configuration.json` 三个文件），把 Release 的下载地址前缀传给 `WEIGHTS_URL`
+离线部署：把仓库打成 zip 放到客户 S3，第 2 步第一个参数改为 `s3://<桶>/src.zip`。
+
+升级 / 回滚：改 `IMAGE_TAG` 重跑第 2 步；两个 Runtime 保留历史版本，CloudFormation 失败自动回滚。删除：`aws cloudformation delete-stack --stack-name chronos2-agentcore`（数据桶保留）。
 
 ## 使用
 
