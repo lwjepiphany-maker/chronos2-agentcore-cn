@@ -30,6 +30,7 @@ from bedrock_agentcore.tools.code_interpreter_client import CodeInterpreter
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import batch  # noqa: E402  批量预测共享逻辑（与 tools/batch_forecast.py 共用）
 import factors  # noqa: E402  节假日 / 促销 / 价格 / 天气协变量构造 + 回测指标
+import master  # noqa: E402  商品主数据 / 库存快照 + 保质期补货计算
 from mcp_proxy_for_aws.client import aws_iam_streamablehttp_client
 from strands import Agent, tool
 from strands.models.openai import OpenAIModel
@@ -50,6 +51,8 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek/deepseek-v4-flash-0731")
 CHART_BUCKET = os.environ.get("CHART_BUCKET", "")
 CHART_PREFIX = os.environ.get("CHART_PREFIX", "chronos2-agent-poc/charts/")
 REPORT_PREFIX = os.environ.get("REPORT_PREFIX", "reports/")   # 批量预测 Excel 报表，与图表同一个桶
+MASTER_PREFIX = os.environ.get("MASTER_PREFIX", "master/")     # 商品主数据 products.parquet / 库存 inventory.parquet
+MASTER = master.Master(CHART_BUCKET, MASTER_PREFIX, REGION) if CHART_BUCKET else None
 
 app = BedrockAgentCoreApp()
 
@@ -388,6 +391,82 @@ def backtest(store: int, skus: list[int] | None = None, horizon: int = 7, folds:
 
 
 @tool
+def inventory_status(store: int, sku: int) -> dict:
+    """查商品主数据（品类、保质期、到货周期、箱规、起订量）和门店库存快照（现有库存、在途、最早到期日），
+    并给出按近 14 天日均可售天数。用户问"库存多少 / 还能卖几天 / 保质期多长"时调用。
+
+    Args:
+        store: 门店代码
+        sku: 商品代码
+    """
+    prod = MASTER.product(sku) if MASTER else None
+    stock = MASTER.stock(store, sku) if MASTER else None
+    hist = _daily_series(store, sku, 14)
+    avg = float(hist.mean()) if len(hist) else 0.0
+    out = {"store": store, "sku": sku, "product": prod or "无主数据", "stock": stock or "无库存快照",
+           "avg_daily_last14": round(avg, 2)}
+    if stock and avg > 0:
+        out["days_of_cover"] = round((stock["on_hand"] + stock["in_transit"]) / avg, 1)
+    if prod and prod.get("source") == "mock":
+        out["note"] = "主数据与库存为演示用模拟数据（客户数据到位后替换）"
+    return out
+
+
+@tool
+def replenishment_plan(store: int, sku: int, shelf_life_days: int | None = None, lead_time_days: int | None = None,
+                       interval_days: int | None = None, case_pack: int | None = None, moq_cases: int | None = None,
+                       on_hand: float | None = None, in_transit: float | None = None, earliest_expiry: str | None = None,
+                       quantile: str | None = None, promo_days: list[str] | None = None) -> dict:
+    """考虑保质期的补货计算：覆盖天数 = min(补货间隔+到货周期, 保质期−到货周期−1)；短保（≤7 天）按 P50、长保按 P90；
+    扣减可用库存与在途（覆盖期内到期的库存不可用），按箱规向上取整、不低于起订量，并给出损耗风险。
+    参数不传时自动取商品主数据与库存快照；用户口述的值优先。用户问"补多少 / 订几箱 / 要不要补货"时调用。
+
+    Args:
+        store: 门店代码
+        sku: 商品代码
+        shelf_life_days: 保质期（天）
+        lead_time_days: 到货周期（天）
+        interval_days: 补货间隔（天）
+        case_pack: 箱规
+        moq_cases: 起订量（箱）
+        on_hand: 现有库存
+        in_transit: 在途数量
+        earliest_expiry: 现有库存最早到期日 YYYY-MM-DD
+        quantile: 强制用哪个分位数备货："0.5" 或 "0.9"；不传按保质期自动
+        promo_days: 覆盖期内的促销日期，有则用带因素预测
+    """
+    prod = (MASTER.product(sku) if MASTER else None) or {}
+    stock = (MASTER.stock(store, sku) if MASTER else None) or {}
+    params = {"shelf_life_days": shelf_life_days or prod.get("shelf_life_days"), "lead_time_days": lead_time_days if lead_time_days is not None else prod.get("lead_time_days"),
+              "interval_days": interval_days or prod.get("replenish_interval_days"), "case_pack": case_pack or prod.get("case_pack"),
+              "moq_cases": moq_cases or prod.get("moq_cases", 1), "on_hand": on_hand if on_hand is not None else stock.get("on_hand"),
+              "in_transit": in_transit if in_transit is not None else stock.get("in_transit", 0),
+              "earliest_expiry": earliest_expiry or stock.get("earliest_expiry")}
+    missing = [k for k in ("shelf_life_days", "lead_time_days", "interval_days", "case_pack", "on_hand") if params[k] is None]
+    if missing:
+        return {"error": f"缺少参数且主数据/库存快照里也没有：{missing}，请用户提供", "known": {k: v for k, v in params.items() if v is not None}}
+    horizon = int(params["lead_time_days"]) + max(1, min(int(params["interval_days"]) + int(params["lead_time_days"]),
+                                                       int(params["shelf_life_days"]) - int(params["lead_time_days"]) - 1))
+    horizon = max(horizon, 1)
+    if promo_days:
+        fc_full = forecast_sku_with_factors(store, sku, days=horizon, promo_days=promo_days)
+        fc = {"0.1": [r["p10"] for r in fc_full["forecast"]], "0.5": [r["p50"] for r in fc_full["forecast"]],
+              "0.9": [r["p90"] for r in fc_full["forecast"]]}
+    else:
+        hist = _daily_series(store, sku, 60)
+        if hist.sum() == 0:
+            return {"error": f"门店 {store} 商品 {sku} 最近 60 天没有销售记录"}
+        fc = _chronos_forecast(hist.tolist(), horizon)
+    result = master.plan(fc, _last_date(), int(params["shelf_life_days"]), int(params["lead_time_days"]), int(params["interval_days"]),
+                         int(params["case_pack"]), int(params["moq_cases"]), float(params["on_hand"]), float(params["in_transit"]),
+                         params["earliest_expiry"], quantile)
+    result.update({"store": store, "sku": sku, "category": prod.get("category"), "params_used": params,
+                   "data_last_date": _last_date().strftime("%Y-%m-%d"),
+                   "source_note": "主数据/库存为演示用模拟数据" if prod.get("source") == "mock" or stock.get("source") == "mock" else "主数据/库存来自客户"})
+    return result
+
+
+@tool
 def forecast_top_skus(stores: list[int] | None = None, n: int = 10, days: int = 7, history_days: int = 60) -> dict:
     """批量预测：各门店近 30 天销量 Top-N 商品的未来 days 天销量，一次调用完成，生成 Excel 报表存到 S3。
     用户要"所有门店 / 多个门店的热销商品批量预测、补货清单、报表"时调用；单个商品用 forecast_sku。
@@ -566,7 +645,9 @@ SYSTEM_PROMPT = f"""你是便利店连锁的补货助手，服务门店运营人
 回答要求：
 - 不要自己猜销量，一律调用 forecast_sku 获取预测；用户关心天气影响时用 forecast_sku_with_weather（会同时给出不带天气的基线）。
 - 门店位于{DEFAULT_CITY}。查天气用 daily_weather（Open-Meteo），不要编造天气。
-- 涉及补货量计算（扣减库存、在途、按箱规取整）或多商品汇总时，用 run_python 精确计算，不要心算。
+- 用户问补多少、订几箱时用 replenishment_plan（自动带入商品主数据与库存快照，考虑保质期；用户口述的库存/箱规优先），并说明覆盖天数和用的分位数；
+  只有 replenishment_plan 缺参数且用户已给全部数字时才用 run_python 手算。问库存、保质期用 inventory_status。
+- 其他多商品汇总、占比等计算用 run_python，不要心算。
 - 用户要图表时调用 plot_forecast，并把返回的 S3 位置告诉用户。
 - 用户提到促销、活动、节假日（五一、国庆等）时用 forecast_sku_with_factors，促销日期用 promo_days 传入；比较"促销 vs 不促销"就调用两次。
 - 用户问准不准、准确率、误差时用 backtest，汇报整体 WAPE / 准确率和最好最差的商品，说明这是历史回测结果。
@@ -611,7 +692,8 @@ def _get_agent() -> Agent:
             last_date = f"未知（销售数据尚未上传到 {DATA_URI}：{e}）"
         _agent = Agent(model=model,
                        tools=[forecast_sku, forecast_sku_with_weather, forecast_sku_with_factors, forecast_top_skus,
-                              backtest, list_top_skus, recent_sales, run_python, plot_forecast] + weather.list_tools_sync(),
+                              backtest, replenishment_plan, inventory_status, list_top_skus, recent_sales,
+                              run_python, plot_forecast] + weather.list_tools_sync(),
                        system_prompt=SYSTEM_PROMPT.replace("{last_date}", last_date), callback_handler=None)
     return _agent
 
