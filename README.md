@@ -32,9 +32,11 @@ AI 助手（Claude Code / Kiro）──mcp-proxy-for-aws──▶ Runtime②（�
 | `tools/export_from_db.py` | 数据库 → parquet → S3 的定时导出模板（生产数据管道） |
 | `tools/mock_master_data.py`、`iac/prepare_master.py` | 模拟 / 转换商品主数据与库存快照（保质期、到货周期、箱规、库存） |
 | `tests/` | 预测服务基准、Agent 对话测试、测试用例生成 |
-| `docs/` | 客户版部署方案、技术指南、销售数据格式说明、两阶段验证报告、`architecture/` 架构图（PNG + 交互式 HTML） |
+| `docs/` | 客户版部署方案、技术指南、部署前检查清单、销售数据格式说明、两阶段验证报告、`architecture/` 架构图（PNG + 交互式 HTML） |
 
 ## 部署（首次 20～30 分钟）
+
+现场部署前先过一遍 `docs/部署前检查清单.md`。
 
 前提：中国区账号已开通 Bedrock AgentCore；部署机有 AWS CLI v2（已配置中国区凭证）和 Python 3.10+；一个 OpenAI 兼容大模型的 API Key。
 **不需要本机 Docker**，镜像由 CodeBuild 在区域内构建。
