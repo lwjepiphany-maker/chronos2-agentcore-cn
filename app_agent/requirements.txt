@@ -7,3 +7,4 @@ pyarrow
 boto3
 requests
 openpyxl
+chinesecalendar
