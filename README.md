@@ -26,9 +26,10 @@ AI 助手（Claude Code / Kiro）──mcp-proxy-for-aws──▶ Runtime②（�
 | `iac/deploy.sh` | 一键脚本：建栈 → 上传数据 → 打印调用方式 |
 | `iac/prepare_data.py` | 销售 Excel → parquet |
 | `app/` | Chronos-2 预测 MCP Server（`server.py`、`Dockerfile`） |
-| `app_agent/` | 补货助手 Agent（`agent.py`）、天气 MCP（`weather_mcp.py`）、批量预测核心（`batch.py`）、业务因素/回测（`factors.py`）、`Dockerfile` |
+| `app_agent/` | 补货助手 Agent（`agent.py`）、天气 MCP（`weather_mcp.py`）、批量预测核心（`batch.py`）、业务因素/回测（`factors.py`）、保质期补货（`master.py`）、`Dockerfile` |
 | `frontend/app.py` | Streamlit 聊天前端（本机 / 内网运行）：对话、上传 Excel、下载报表 |
 | `tools/batch_forecast.py` | 命令行批量预测（各店 Top-N → Excel），供定时任务 |
+| `tools/mock_master_data.py`、`iac/prepare_master.py` | 模拟 / 转换商品主数据与库存快照（保质期、到货周期、箱规、库存） |
 | `tests/` | 预测服务基准、Agent 对话测试、测试用例生成 |
 | `docs/` | 客户版部署方案、技术指南、销售数据格式说明、两阶段验证报告、`architecture/` 架构图（PNG + 交互式 HTML） |
 
@@ -63,6 +64,7 @@ streamlit run frontend/app.py -- --agent-arn <AgentRuntimeArn> --data-bucket <Da
 - 批量：问"所有门店热销 Top10 商品下周销量批量预测，生成报表"，Agent 一次调用 `batch_forecast` 生成 Excel（6 店 × 10 品约 3 秒）
 - 业务因素：问"5 号店 12080084 下周五到周日做促销价，销量多少"，Agent 把促销计划 + 节假日（离线日历）+ 天气 + 价格作为协变量预测并给出基线对比
 - 回测：问"5 号店 Top10 最近 4 周预测准不准"，Agent 滚动回测给出 WAPE / 准确率和最好最差商品
+- 补货：问"5 号店 12070007 要补多少"，Agent 读商品主数据（保质期、到货周期、箱规）和库存快照，按保质期选 P50/P90、扣减可用库存、按箱规取整，并提示损耗风险（客户数据未到位前为模拟主数据）
 
 ### 1b. 定时跑批（不经过大模型）
 

@@ -452,7 +452,7 @@ Resources:
                   - !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:aws:code-interpreter/aws.codeinterpreter.v1/*"
               - Effect: Allow
                 Action: s3:GetObject
-                Resource: !Sub "${DataBucket.Arn}/data/*"
+                Resource: [!Sub "${DataBucket.Arn}/data/*", !Sub "${DataBucket.Arn}/master/*"]
               - Effect: Allow
                 Action: s3:PutObject
                 Resource: [!Sub "${DataBucket.Arn}/charts/*", !Sub "${DataBucket.Arn}/reports/*"]
@@ -497,6 +497,7 @@ Resources:
         CHART_BUCKET: !Ref DataBucket
         CHART_PREFIX: charts/
         REPORT_PREFIX: reports/
+        MASTER_PREFIX: master/
         API_KEY_PROVIDER: !Sub "${RuntimeNamePrefix}-llm-key"
         LLM_BASE_URL: !Ref LlmBaseUrl
         LLM_MODEL: !Ref LlmModel
