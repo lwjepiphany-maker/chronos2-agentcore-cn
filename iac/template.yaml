@@ -209,9 +209,10 @@ Resources:
                   aws ecr get-login-password | docker login --username AWS --password-stdin "${CHRONOS_REPO_URI%%/*}"
                   tag_exists() { aws ecr describe-images --repository-name "$1" --image-ids imageTag="$2" >/dev/null 2>&1; }
                   # 源码内容哈希：内容没变就把已有镜像重新打上新 tag（秒级），不重复下载 torch / 构建
-                  content_hash() { { find "$@" -type f -print0 | sort -z | xargs -0 sha256sum; echo "$WEIGHTS_URL"; } | sha256sum | cut -c1-16; }
+                  content_hash() { { find "$@" -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum; echo "$WEIGHTS_URL"; } | sha256sum | cut -c1-16; }
                   build_or_reuse() {   # $1 repo uri  $2 hash tag  $3 dockerfile
                     local repo="${1##*/}"
+                    echo "$repo content hash tag: $2"
                     if tag_exists "$repo" "$IMAGE_TAG"; then echo "$repo:$IMAGE_TAG already exists, skipping"; return; fi
                     if tag_exists "$repo" "$2"; then
                       echo "$repo: source unchanged ($2), re-tagging existing image as $IMAGE_TAG"
