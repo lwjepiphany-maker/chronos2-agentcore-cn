@@ -205,13 +205,23 @@ Resources:
                   # 权重文件应为 ~478MB；小于 400MB 说明下载到了错误页面
                   [ "$(stat -c %s model/model.safetensors)" -gt 400000000 ] || { echo "model.safetensors too small, download failed"; false; }
 
-                  echo "==> build & push images (native arm64); skip an image whose tag already exists in ECR"
+                  echo "==> build & push images (native arm64)"
                   aws ecr get-login-password | docker login --username AWS --password-stdin "${CHRONOS_REPO_URI%%/*}"
-                  image_exists() { aws ecr describe-images --repository-name "$1" --image-ids imageTag="$IMAGE_TAG" >/dev/null 2>&1; }
-                  if image_exists "${CHRONOS_REPO_URI##*/}"; then echo "forecast image $IMAGE_TAG already in ECR, skipping"; else
-                    docker build -f app/Dockerfile -t "$CHRONOS_REPO_URI:$IMAGE_TAG" . && docker push "$CHRONOS_REPO_URI:$IMAGE_TAG"; fi
-                  if image_exists "${AGENT_REPO_URI##*/}"; then echo "agent image $IMAGE_TAG already in ECR, skipping"; else
-                    docker build -f app_agent/Dockerfile -t "$AGENT_REPO_URI:$IMAGE_TAG" . && docker push "$AGENT_REPO_URI:$IMAGE_TAG"; fi
+                  tag_exists() { aws ecr describe-images --repository-name "$1" --image-ids imageTag="$2" >/dev/null 2>&1; }
+                  # 源码内容哈希：内容没变就把已有镜像重新打上新 tag（秒级），不重复下载 torch / 构建
+                  content_hash() { { find "$@" -type f -print0 | sort -z | xargs -0 sha256sum; echo "$WEIGHTS_URL"; } | sha256sum | cut -c1-16; }
+                  build_or_reuse() {   # $1 repo uri  $2 hash tag  $3 dockerfile
+                    local repo="${1##*/}"
+                    if tag_exists "$repo" "$IMAGE_TAG"; then echo "$repo:$IMAGE_TAG already exists, skipping"; return; fi
+                    if tag_exists "$repo" "$2"; then
+                      echo "$repo: source unchanged ($2), re-tagging existing image as $IMAGE_TAG"
+                      local manifest; manifest=$(aws ecr batch-get-image --repository-name "$repo" --image-ids imageTag="$2" --query 'images[0].imageManifest' --output text)
+                      aws ecr put-image --repository-name "$repo" --image-tag "$IMAGE_TAG" --image-manifest "$manifest" >/dev/null; return
+                    fi
+                    docker build -f "$3" -t "$1:$IMAGE_TAG" -t "$1:$2" . && docker push "$1:$IMAGE_TAG" && docker push "$1:$2"
+                  }
+                  build_or_reuse "$CHRONOS_REPO_URI" "src-$(content_hash app)" app/Dockerfile
+                  build_or_reuse "$AGENT_REPO_URI" "src-$(content_hash app_agent)" app_agent/Dockerfile
 
                   echo "==> LLM API key -> AgentCore Identity provider $PROVIDER_NAME"
                   if aws bedrock-agentcore-control get-api-key-credential-provider --name "$PROVIDER_NAME" >/dev/null 2>&1; then
