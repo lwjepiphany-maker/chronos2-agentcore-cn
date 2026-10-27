@@ -4,6 +4,10 @@
 补货助手 Agent（Strands Agents SDK + 国产大模型）同样托管在 Runtime，结合 Open-Meteo 天气、Code Interpreter 精确计算和图表。
 2026 年 10 月在 AWS 中国（宁夏）区域验证通过。
 
+![架构图](docs/architecture/chronos2-agentcore.png)
+
+交互式版本（可点节点看源码引用、切换深浅主题、导出图片）：[docs/architecture/chronos2-agentcore.html](docs/architecture/chronos2-agentcore.html)（下载后用浏览器打开）。图由 [Archify](https://github.com/tt-a1i/archify) 基于本仓库代码与 `iac/template.yaml` 生成，每个节点附源码行号。
+
 ```
 业务系统 / 前端 ──IAM──▶ Runtime①：补货助手 Agent ──▶ 大模型 API（OpenAI 兼容）
                               ├──▶ Runtime②：Chronos-2 预测 MCP（CPU）
@@ -25,7 +29,7 @@ AI 助手（Claude Code / Kiro）──mcp-proxy-for-aws──▶ Runtime②（�
 | `app_agent/` | 补货助手 Agent（`agent.py`）、天气 MCP（`weather_mcp.py`）、`Dockerfile` |
 | `frontend/app.py` | Streamlit 聊天前端（本机 / 内网运行） |
 | `tests/` | 预测服务基准、Agent 对话测试、测试用例生成 |
-| `docs/` | 客户版部署方案、技术指南、两阶段验证报告 |
+| `docs/` | 客户版部署方案、技术指南、两阶段验证报告、`architecture/` 架构图（PNG + 交互式 HTML） |
 
 ## 部署（约 25 分钟）
 
