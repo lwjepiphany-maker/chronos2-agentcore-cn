@@ -26,6 +26,9 @@ import boto3
 import pandas as pd
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from bedrock_agentcore.tools.code_interpreter_client import CodeInterpreter
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import batch  # noqa: E402  批量预测共享逻辑（与 tools/batch_forecast.py 共用）
 from mcp_proxy_for_aws.client import aws_iam_streamablehttp_client
 from strands import Agent, tool
 from strands.models.openai import OpenAIModel
@@ -43,6 +46,7 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek/deepseek-v4-flash-0731")
 # Code Interpreter 生成的图表存到这个私有桶前缀（不走预签名 URL，前端用 IAM 读取）
 CHART_BUCKET = os.environ.get("CHART_BUCKET", "")
 CHART_PREFIX = os.environ.get("CHART_PREFIX", "chronos2-agent-poc/charts/")
+REPORT_PREFIX = os.environ.get("REPORT_PREFIX", "reports/")   # 批量预测 Excel 报表，与图表同一个桶
 
 app = BedrockAgentCoreApp()
 
@@ -70,23 +74,43 @@ def _latest_window(dates: pd.Series) -> pd.DatetimeIndex:
 
 
 class _Data:
-    """销售数据延迟加载：数据文件可能在 Runtime 创建之后才上传（IaC 先建栈再传数据），
-    启动时读不到不能让进程退出，否则 Runtime 创建失败；改为首次使用时加载，失败则工具返回提示。"""
+    """销售数据延迟加载 + 热更新：
+    - 数据文件可能在 Runtime 创建之后才上传（IaC 先建栈再传数据），启动时读不到不能让进程退出；
+    - 前端重新上传 Excel 后，用 S3 对象的 ETag 判断是否变化（最多每 30 s 查一次 HEAD），变了就重新加载，不用等新会话。"""
     df: pd.DataFrame | None = None
     last_date: pd.Timestamp | None = None
     days: pd.DatetimeIndex | None = None
+    etag: str | None = None
+    checked_at: float = 0.0
     _lock = threading.Lock()
+    CHECK_INTERVAL = 30
+
+    @classmethod
+    def _remote_etag(cls) -> str | None:
+        if not DATA_URI.startswith("s3://"):
+            return None
+        bucket, key = DATA_URI[5:].split("/", 1)
+        return boto3.client("s3", region_name=REGION).head_object(Bucket=bucket, Key=key)["ETag"]
 
     @classmethod
     def ensure(cls) -> pd.DataFrame:
         with cls._lock:
-            if cls.df is None:
+            now = time.time()
+            stale = cls.df is None
+            if not stale and now - cls.checked_at > cls.CHECK_INTERVAL:
+                try:
+                    stale = cls._remote_etag() != cls.etag
+                except Exception as e:  # noqa: BLE001  检查失败不影响已加载的数据
+                    logger.warning(f"etag check failed: {e}")
+                cls.checked_at = now
+            if stale:
                 try:
                     df = _load_sales()
+                    cls.etag = cls._remote_etag()
                 except Exception as e:  # noqa: BLE001
                     raise RuntimeError(f"销售数据未就位，请先上传 {DATA_URI}（{type(e).__name__}）") from e
-                cls.df, cls.last_date, cls.days = df, df.date.max(), _latest_window(df.date)
-                logger.info(f"latest contiguous window {cls.days[0].date()} ~ {cls.days[-1].date()} ({len(cls.days)} days)")
+                cls.df, cls.last_date, cls.days, cls.checked_at = df, df.date.max(), _latest_window(df.date), now
+                logger.info(f"sales data (re)loaded etag={cls.etag} window {cls.days[0].date()} ~ {cls.days[-1].date()} ({len(cls.days)} days)")
             return cls.df
 
 
@@ -240,6 +264,42 @@ def forecast_sku_with_weather(store: int, sku: int, days: int = 7, history_days:
 
 
 @tool
+def forecast_top_skus(stores: list[int] | None = None, n: int = 10, days: int = 7, history_days: int = 60) -> dict:
+    """批量预测：各门店近 30 天销量 Top-N 商品的未来 days 天销量，一次调用完成，生成 Excel 报表存到 S3。
+    用户要"所有门店 / 多个门店的热销商品批量预测、补货清单、报表"时调用；单个商品用 forecast_sku。
+    返回每店合计与前 3 名摘要以及报表位置，不要逐行复述报表。
+
+    Args:
+        stores: 门店代码列表，不传 = 全部门店
+        n: 每店取前几名，默认 10
+        days: 预测天数，默认 7
+        history_days: 历史窗口天数，默认 60
+    """
+    if not CHART_BUCKET:
+        return {"error": "未配置 CHART_BUCKET，无法保存报表"}
+    df = _Data.ensure()
+    t0 = time.time()
+
+    def _bf(series, pdays):
+        return _chronos_call("batch_forecast", {"time_series": series, "prediction_length": pdays})
+
+    report = batch.run_batch(df, _bf, stores, n, days, history_days)
+    meta = {"生成时间": time.strftime("%Y-%m-%d %H:%M"), "数据截止": _last_date().strftime("%Y-%m-%d"),
+            "门店": "全部" if not stores else ",".join(map(str, stores)), "每店 Top": n, "预测天数": days,
+            "历史窗口": history_days, "模型": "Chronos-2（Amazon Bedrock AgentCore Runtime, CPU）",
+            "口径": "P50 = 常规备货量；P90 = 安全库存上限"}
+    key = f"{REPORT_PREFIX}top{n}_{days}d_{time.strftime('%Y%m%d-%H%M%S')}.xlsx"
+    boto3.client("s3", region_name=REGION).put_object(
+        Bucket=CHART_BUCKET, Key=key, Body=batch.to_excel_bytes(report, meta),
+        ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    logger.info(f"batch report rows={len(report)} s3://{CHART_BUCKET}/{key} latency_ms={(time.time() - t0) * 1000:.0f}")
+    summary = batch.summarize(report, days)
+    summary.update({"report_s3_uri": f"s3://{CHART_BUCKET}/{key}", "data_last_date": meta["数据截止"],
+                    "note": "完整逐日 P50/P90 在 Excel 报表里，前端可直接下载"})
+    return summary
+
+
+@tool
 def list_top_skus(store: int, n: int = 10, days: int = 30) -> dict:
     """列出某门店最近 days 天销量最高的 n 个商品。
 
@@ -384,6 +444,7 @@ SYSTEM_PROMPT = f"""你是便利店连锁的补货助手，服务门店运营人
 - 门店位于{DEFAULT_CITY}。查天气用 daily_weather（Open-Meteo），不要编造天气。
 - 涉及补货量计算（扣减库存、在途、按箱规取整）或多商品汇总时，用 run_python 精确计算，不要心算。
 - 用户要图表时调用 plot_forecast，并把返回的 S3 位置告诉用户。
+- 用户要多门店 / 热销商品的批量预测或补货清单时，调用 forecast_top_skus（一次完成并生成 Excel），只汇报每店合计和前几名，并给出报表的 S3 位置。
 - 用中文、简洁地给出：预测的每日 P50、合计 P50（常规备货量）和 P90（安全库存上限），并简述近期销量趋势。
 - 用户只说商品名没有商品代码时，用 list_top_skus 帮用户定位，或请用户提供商品代码。
 """
@@ -423,8 +484,8 @@ def _get_agent() -> Agent:
         except Exception as e:  # noqa: BLE001
             last_date = f"未知（销售数据尚未上传到 {DATA_URI}：{e}）"
         _agent = Agent(model=model,
-                       tools=[forecast_sku, forecast_sku_with_weather, list_top_skus, recent_sales,
-                              run_python, plot_forecast] + weather.list_tools_sync(),
+                       tools=[forecast_sku, forecast_sku_with_weather, forecast_top_skus, list_top_skus,
+                              recent_sales, run_python, plot_forecast] + weather.list_tools_sync(),
                        system_prompt=SYSTEM_PROMPT.replace("{last_date}", last_date), callback_handler=None)
     return _agent
 

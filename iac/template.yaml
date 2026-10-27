@@ -68,6 +68,7 @@ Resources:
     UpdateReplacePolicy: Retain
     Properties:
       BucketName: !Sub "${RuntimeNamePrefix}-agent-data-${AWS::AccountId}"
+      VersioningConfiguration: { Status: Enabled }   # 上传错数据可回退到上一版
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -454,7 +455,7 @@ Resources:
                 Resource: !Sub "${DataBucket.Arn}/data/*"
               - Effect: Allow
                 Action: s3:PutObject
-                Resource: !Sub "${DataBucket.Arn}/charts/*"
+                Resource: [!Sub "${DataBucket.Arn}/charts/*", !Sub "${DataBucket.Arn}/reports/*"]
 
   # ------------------------------------------------------------------ AgentCore Runtimes
   ChronosRuntime:
@@ -495,6 +496,7 @@ Resources:
         DATA_URI: !Sub "s3://${DataBucket}/data/sales_daily.parquet"
         CHART_BUCKET: !Ref DataBucket
         CHART_PREFIX: charts/
+        REPORT_PREFIX: reports/
         API_KEY_PROVIDER: !Sub "${RuntimeNamePrefix}-llm-key"
         LLM_BASE_URL: !Ref LlmBaseUrl
         LLM_MODEL: !Ref LlmModel
@@ -510,7 +512,7 @@ Outputs:
     Value: !GetAtt AgentRuntime.AgentRuntimeArn
   DataBucket:
     Value: !Ref DataBucket
-    Description: Upload sales history to s3://<bucket>/data/sales_daily.parquet; charts land under charts/
+    Description: Upload sales history to s3://<bucket>/data/sales_daily.parquet; charts under charts/, batch reports under reports/
   BuildProject:
     Value: !Ref BuildProject
     Description: CodeBuild project (logs under /aws/codebuild/<name>)
