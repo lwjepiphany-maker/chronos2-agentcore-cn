@@ -29,6 +29,7 @@ from bedrock_agentcore.tools.code_interpreter_client import CodeInterpreter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import batch  # noqa: E402  批量预测共享逻辑（与 tools/batch_forecast.py 共用）
+import factors  # noqa: E402  节假日 / 促销 / 价格 / 天气协变量构造 + 回测指标
 from mcp_proxy_for_aws.client import aws_iam_streamablehttp_client
 from strands import Agent, tool
 from strands.models.openai import OpenAIModel
@@ -266,6 +267,127 @@ def forecast_sku_with_weather(store: int, sku: int, days: int = 7, history_days:
 
 
 @tool
+def forecast_sku_with_factors(store: int, sku: int, days: int = 7, history_days: int = 60,
+                              promo_days: list[str] | None = None, promo_type: str = "促销价",
+                              discount_per_unit: float | None = None, use_weather: bool = True) -> dict:
+    """带业务因素的预测：节假日（离线日历自动）、促销计划（用户给出的促销日期/类型/单件优惠）、价格、天气、星期
+    一起作为协变量输入 Chronos-2，并与不带因素的基线对比。用户提到"促销 / 活动 / 节假日 / 五一 / 国庆"等场景时调用；
+    对比"促销 vs 不促销"时调用两次（一次传 promo_days，一次不传）。
+
+    Args:
+        store: 门店代码
+        sku: 商品代码
+        days: 预测天数，默认 7
+        history_days: 历史窗口，默认 60
+        promo_days: 未来促销日期列表，如 ["2026-05-29","2026-05-30"]。不传 = 自动：若该商品历史上大部分时间在促销，
+            则默认未来继续促销（很多商品长期挂促销价）；传空列表 [] = 明确未来不促销（用于算"停止促销"的影响）
+        promo_type: 促销类型：促销价 / 换购 / 折扣 / 立减 / 赠品，默认取该商品历史最常见类型
+        discount_per_unit: 单件优惠金额（元），不传则用该商品历史促销的平均值
+        use_weather: 是否取 Open-Meteo 未来天气作为协变量，默认是
+    """
+    df = _Data.ensure()
+    hist = _daily_series(store, sku, history_days)
+    if hist.sum() == 0:
+        return {"error": f"门店 {store} 商品 {sku} 最近 {history_days} 天没有销售记录"}
+    fut_idx = pd.date_range(_last_date() + pd.Timedelta(days=1), periods=days, freq="D")
+    past = factors.past_covariates(df, store, sku, hist.index)
+    wx = None
+    if use_weather and "weather" in past:
+        try:
+            wx = _weather_days(STORE_CITY.get(str(store), DEFAULT_CITY), fut_idx[0], fut_idx[-1])
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"weather unavailable, continuing without forecast weather: {e}")
+    promo_share = (sum(past["has_promotion"]) / len(past["has_promotion"])) if "has_promotion" in past else 0.0
+    hist_types = [t for t in past.get("promo_type", []) if t != "无促销"]
+    if hist_types and promo_type == "促销价":
+        promo_type = max(set(hist_types), key=hist_types.count)   # 历史最常见的促销类型
+    if promo_days is None:
+        promo_mode = "沿用历史：继续促销" if promo_share >= 0.5 else "沿用历史：无促销"
+        promo_days = [d.strftime("%Y-%m-%d") for d in fut_idx] if promo_share >= 0.5 else []
+    else:
+        promo_mode = "用户指定" if promo_days else "明确无促销"
+    fut = factors.future_covariates(past, fut_idx, promo_days, promo_type, discount_per_unit, wx)
+    fc = _chronos_call("forecast_with_covariates", {"history": hist.tolist(), "past_covariates": past,
+                                                    "future_covariates": fut, "prediction_length": days})
+    base = _chronos_forecast(hist.tolist(), days)
+    nz = lambda v: round(max(0.0, v), 1)   # 销量不为负
+    rows = []
+    for i, d in enumerate(fut_idx):
+        r = {"date": d.strftime("%Y-%m-%d"), "weekday": "一二三四五六日"[d.weekday()], "holiday": fut.get("holiday", [""] * days)[i],
+             "promo": fut.get("promo_type", ["-"] * days)[i], "p10": nz(fc["0.1"][i]), "p50": nz(fc["0.5"][i]),
+             "p90": nz(fc["0.9"][i]), "baseline_p50": nz(base["0.5"][i])}
+        if "weather" in fut:
+            r["weather"] = f"{fut['weather'][i]} {fut['temp_low'][i]:.0f}~{fut['temp_high'][i]:.0f}℃"
+        rows.append(r)
+    out = {"store": store, "sku": sku, "data_last_date": _last_date().strftime("%Y-%m-%d"),
+           "covariates_used": sorted(fut.keys()), "promo_mode": promo_mode, "promo_type": promo_type, "promo_days": promo_days,
+           "history_promo_share": round(promo_share, 2),
+           "forecast": rows,
+           "totals": {"with_factors_p50": round(sum(max(0.0, v) for v in fc["0.5"]), 1),
+                      "with_factors_p90": round(sum(max(0.0, v) for v in fc["0.9"]), 1),
+                      "baseline_p50": round(sum(max(0.0, v) for v in base["0.5"]), 1)}}
+    if promo_share >= 0.8 and not promo_days:
+        out["caution"] = (f"该商品历史 {promo_share:.0%} 的日子都在促销，没有『不促销』的历史样本，"
+                          "不促销情景的预测属于外推，可信度低，建议只做方向性参考。")
+    return out
+
+
+@tool
+def backtest(store: int, skus: list[int] | None = None, horizon: int = 7, folds: int = 4,
+             history_days: int = 60, top_n: int = 10, compare_factors: bool = False) -> dict:
+    """回测预测精度：在已有数据上滚动切分，用前面的历史预测后面 horizon 天，与真实销量比较，给出 WAPE（加权绝对百分比误差，越低越好）。
+    用户问"预测准不准 / 准确率 / 误差多大"时调用。一次 batch_forecast 评估多个商品。
+
+    Args:
+        store: 门店代码
+        skus: 商品代码列表；不传 = 该店近 30 天销量 Top-N
+        horizon: 每折预测天数，默认 7
+        folds: 滚动折数，默认 4（即回看最近 4 周）
+        history_days: 每折使用的历史长度，默认 60
+        top_n: skus 不传时取前几名，默认 10
+        compare_factors: 是否同时回测"带业务因素"模型（节假日/促销/价格/天气用历史真实值），对比基线；多 N×折 次调用，约 10~30 秒
+    """
+    df = _Data.ensure()
+    if not skus:
+        skus = [k for s_, k, _ in batch.top_skus(df, [store], top_n, 30)]
+    full = {k: _daily_series(store, k, len(_Data.days)) for k in skus}
+    n = len(_Data.days)
+    need = history_days + horizon * folds
+    if n < need:
+        folds = max(1, (n - history_days) // horizon)
+    per_fold, per_sku_err = [], {k: [0.0, 0.0] for k in skus}
+    fac_ae = fac_tot = 0.0
+    for f in range(folds, 0, -1):
+        cut = n - horizon * f                     # 用 [cut-history_days, cut) 预测 [cut, cut+horizon)
+        series = [full[k].iloc[max(0, cut - history_days):cut].tolist() for k in skus]
+        preds = _chronos_call("batch_forecast", {"time_series": series, "prediction_length": horizon})
+        ae = tot = 0.0
+        for k, p in zip(skus, preds):
+            actual = full[k].iloc[cut:cut + horizon].tolist()
+            e = sum(abs(a - b) for a, b in zip(p["0.5"], actual)); t = sum(actual)
+            ae += e; tot += t; per_sku_err[k][0] += e; per_sku_err[k][1] += t
+            if compare_factors:   # 用历史真实协变量（"事后已知"）回测带因素模型
+                hidx = full[k].index[max(0, cut - history_days):cut]; fidx = full[k].index[cut:cut + horizon]
+                pc = factors.past_covariates(df, store, k, hidx); fcov = factors.past_covariates(df, store, k, fidx)
+                fcov = {key: fcov[key] for key in pc.keys() if key in fcov}
+                pf = _chronos_call("forecast_with_covariates", {"history": series[skus.index(k)], "past_covariates": pc,
+                                                                "future_covariates": fcov, "prediction_length": horizon})
+                fac_ae += sum(abs(max(0.0, a) - b) for a, b in zip(pf["0.5"], actual)); fac_tot += t
+        per_fold.append({"forecast_start": _Data.days[cut].strftime("%Y-%m-%d"), "wape": round(ae / tot, 4) if tot else None,
+                         "actual_total": round(tot, 1)})
+    overall_ae = sum(v[0] for v in per_sku_err.values()); overall_tot = sum(v[1] for v in per_sku_err.values())
+    by_sku = sorted([{"sku": k, "wape": round(v[0] / v[1], 4) if v[1] else None, "actual_total": round(v[1], 1)}
+                     for k, v in per_sku_err.items()], key=lambda x: (x["wape"] is None, x["wape"] or 0))
+    return {"store": store, "skus": len(skus), "horizon": horizon, "folds": len(per_fold), "history_days": history_days,
+            "overall_wape": round(overall_ae / overall_tot, 4) if overall_tot else None,
+            "overall_accuracy_pct": round((1 - overall_ae / overall_tot) * 100, 1) if overall_tot else None,
+            "per_fold": per_fold, "best_skus": by_sku[:3], "worst_skus": by_sku[-3:],
+            **({"with_factors_wape": round(fac_ae / fac_tot, 4), "with_factors_accuracy_pct": round((1 - fac_ae / fac_tot) * 100, 1)}
+               if compare_factors and fac_tot else {}),
+            "note": "WAPE = Σ|预测-实际| / Σ实际；准确率 = 1 - WAPE。基线 = P50 点预测不带协变量；带因素 = 用历史真实的节假日/促销/价格/天气作协变量。"}
+
+
+@tool
 def forecast_top_skus(stores: list[int] | None = None, n: int = 10, days: int = 7, history_days: int = 60) -> dict:
     """批量预测：各门店近 30 天销量 Top-N 商品的未来 days 天销量，一次调用完成，生成 Excel 报表存到 S3。
     用户要"所有门店 / 多个门店的热销商品批量预测、补货清单、报表"时调用；单个商品用 forecast_sku。
@@ -446,6 +568,8 @@ SYSTEM_PROMPT = f"""你是便利店连锁的补货助手，服务门店运营人
 - 门店位于{DEFAULT_CITY}。查天气用 daily_weather（Open-Meteo），不要编造天气。
 - 涉及补货量计算（扣减库存、在途、按箱规取整）或多商品汇总时，用 run_python 精确计算，不要心算。
 - 用户要图表时调用 plot_forecast，并把返回的 S3 位置告诉用户。
+- 用户提到促销、活动、节假日（五一、国庆等）时用 forecast_sku_with_factors，促销日期用 promo_days 传入；比较"促销 vs 不促销"就调用两次。
+- 用户问准不准、准确率、误差时用 backtest，汇报整体 WAPE / 准确率和最好最差的商品，说明这是历史回测结果。
 - 用户要多门店 / 热销商品的批量预测或补货清单时，调用 forecast_top_skus（一次完成并生成 Excel），只汇报每店合计和前几名，并给出报表的 S3 位置。
 - 用中文、简洁地给出：预测的每日 P50、合计 P50（常规备货量）和 P90（安全库存上限），并简述近期销量趋势。
 - 用户只说商品名没有商品代码时，用 list_top_skus 帮用户定位，或请用户提供商品代码。
@@ -486,8 +610,8 @@ def _get_agent() -> Agent:
         except Exception as e:  # noqa: BLE001
             last_date = f"未知（销售数据尚未上传到 {DATA_URI}：{e}）"
         _agent = Agent(model=model,
-                       tools=[forecast_sku, forecast_sku_with_weather, forecast_top_skus, list_top_skus,
-                              recent_sales, run_python, plot_forecast] + weather.list_tools_sync(),
+                       tools=[forecast_sku, forecast_sku_with_weather, forecast_sku_with_factors, forecast_top_skus,
+                              backtest, list_top_skus, recent_sales, run_python, plot_forecast] + weather.list_tools_sync(),
                        system_prompt=SYSTEM_PROMPT.replace("{last_date}", last_date), callback_handler=None)
     return _agent
 

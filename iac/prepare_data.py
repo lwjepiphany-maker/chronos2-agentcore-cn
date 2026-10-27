@@ -14,7 +14,13 @@ import sys
 import pandas as pd
 
 REQUIRED = ["记账日期", "门店代码", "商品代码", "销售数量"]
-OPTIONAL = ["门店类型", "天气", "温度", "星期"]
+OPTIONAL = ["门店类型", "天气", "温度", "星期",
+            "商品品牌", "节假日", "门店商品ABC属性", "门店售价", "促销类型", "促销数量", "优惠金额", "促销单据类别"]
+ALIASES = {"门代码": "门店代码", "售价": "门店售价"}   # 客户不同版本 Excel 的列名差异
+# 输出列名（英文）与 Excel 列的对应
+EXTRA_MAP = {"商品品牌": "brand", "节假日": "holiday", "门店商品ABC属性": "abc", "门店售价": "price",
+             "促销类型": "promo_type", "促销数量": "promo_qty", "优惠金额": "promo_discount", "促销单据类别": "promo_doc"}
+NUMERIC_EXTRA = {"price", "promo_qty", "promo_discount"}
 
 
 def _temps(s):
@@ -25,7 +31,12 @@ def _temps(s):
 def convert_excel(src) -> pd.DataFrame:
     """src 可以是路径或文件对象。缺少必需列、日期无法解析时抛 ValueError（中文提示）。"""
     sheets = pd.read_excel(src, sheet_name=None)
-    df = pd.concat(sheets.values(), ignore_index=True)
+    # 只合并包含必需列的 sheet（如客户文件里单独的"促销明细"sheet 结构不同，跳过）
+    frames = [f.rename(columns=ALIASES) for f in sheets.values()]
+    frames = [f for f in frames if all(c in f.columns for c in REQUIRED)]
+    if not frames:
+        raise ValueError(f"没有任何 sheet 同时包含必需列 {REQUIRED}（门店代码也可写作“门代码”）")
+    df = pd.concat(frames, ignore_index=True)
     missing = [c for c in REQUIRED if c not in df.columns]
     if missing:
         raise ValueError(f"Excel 缺少必需列：{missing}；需要 {REQUIRED}，可选 {OPTIONAL}")
@@ -46,7 +57,12 @@ def convert_excel(src) -> pd.DataFrame:
         "weather": df["天气"].astype(str),
         "temp_low": df["temp_low"], "temp_high": df["temp_high"],
         "weekday": df["星期"].astype(str),
-    }).dropna(subset=["store", "sku", "qty"])
+    })
+    # 促销 / 节假日 / 价格 / 品牌 / ABC 等可选特征（有则带上，作为预测协变量）
+    for col, name in EXTRA_MAP.items():
+        if col in df.columns and df[col].notna().any():
+            out[name] = pd.to_numeric(df[col], errors="coerce") if name in NUMERIC_EXTRA else df[col].astype("string")
+    out = out.dropna(subset=["store", "sku", "qty"])
     out["store"] = out["store"].astype(int)
     out["sku"] = out["sku"].astype(int)
     out["qty"] = out["qty"].astype(float)
@@ -62,8 +78,10 @@ def to_parquet_bytes(df: pd.DataFrame) -> bytes:
 
 
 def describe(df: pd.DataFrame) -> str:
+    extras = [n for n in EXTRA_MAP.values() if n in df.columns]
     return (f"{len(df)} 行，{df.date.min().date()} ~ {df.date.max().date()}，"
-            f"{df.store.nunique()} 家门店，{df.sku.nunique()} 个商品")
+            f"{df.store.nunique()} 家门店，{df.sku.nunique()} 个商品"
+            + (f"，附加特征：{'、'.join(extras)}" if extras else ""))
 
 
 if __name__ == "__main__":
