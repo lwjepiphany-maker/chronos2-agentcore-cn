@@ -26,8 +26,9 @@ AI 助手（Claude Code / Kiro）──mcp-proxy-for-aws──▶ Runtime②（�
 | `iac/deploy.sh` | 一键脚本：建栈 → 上传数据 → 打印调用方式 |
 | `iac/prepare_data.py` | 销售 Excel → parquet |
 | `app/` | Chronos-2 预测 MCP Server（`server.py`、`Dockerfile`） |
-| `app_agent/` | 补货助手 Agent（`agent.py`）、天气 MCP（`weather_mcp.py`）、`Dockerfile` |
-| `frontend/app.py` | Streamlit 聊天前端（本机 / 内网运行） |
+| `app_agent/` | 补货助手 Agent（`agent.py`）、天气 MCP（`weather_mcp.py`）、批量预测核心（`batch.py`）、`Dockerfile` |
+| `frontend/app.py` | Streamlit 聊天前端（本机 / 内网运行）：对话、上传 Excel、下载报表 |
+| `tools/batch_forecast.py` | 命令行批量预测（各店 Top-N → Excel），供定时任务 |
 | `tests/` | 预测服务基准、Agent 对话测试、测试用例生成 |
 | `docs/` | 客户版部署方案、技术指南、两阶段验证报告、`architecture/` 架构图（PNG + 交互式 HTML） |
 
@@ -54,8 +55,21 @@ LLM_API_KEY='sk_xxx' bash iac/deploy.sh https://github.com/<you>/chronos2-agentc
 
 ```bash
 pip install -r frontend/requirements.txt
-streamlit run frontend/app.py -- --agent-arn <AgentRuntimeArn> --region cn-northwest-1
+streamlit run frontend/app.py -- --agent-arn <AgentRuntimeArn> --data-bucket <DataBucket> --region cn-northwest-1
 ```
+
+- 聊天提问；图表和 Excel 报表自动从 S3 取回显示 / 提供下载
+- 侧栏"上传销售 Excel"：转换校验后覆盖 `data/sales_daily.parquet`，Agent 30 秒内自动切到新数据（S3 开了版本控制，可回退）
+- 批量：问"所有门店热销 Top10 商品下周销量批量预测，生成报表"，Agent 一次调用 `batch_forecast` 生成 Excel（6 店 × 10 品约 3 秒）
+
+### 1b. 定时跑批（不经过大模型）
+
+```bash
+python tools/batch_forecast.py --excel 门店销售数据.xlsx --chronos-arn <ChronosRuntimeArn> --top 10 --days 7 \
+  --out reports/top10.xlsx [--upload s3://<DataBucket>/reports/]
+```
+
+同一套核心逻辑（`app_agent/batch.py`），适合 cron / EventBridge 每日生成补货清单；也可 `--parquet s3://<DataBucket>/data/sales_daily.parquet` 直接用线上数据。
 
 ### 2. 业务系统直接调用 Agent
 
