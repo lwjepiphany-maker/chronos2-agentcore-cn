@@ -50,26 +50,63 @@ LLM_API_KEY='sk_xxx' bash iac/deploy.sh https://github.com/<you>/chronos2-agentc
 
 ## 使用
 
+### 1. 前端（门店运营人员，本机或内网）
+
 ```bash
-# 前端（本机）
 pip install -r frontend/requirements.txt
 streamlit run frontend/app.py -- --agent-arn <AgentRuntimeArn> --region cn-northwest-1
+```
 
-# 业务系统直接调用
+### 2. 业务系统直接调用 Agent
+
+```bash
 aws bedrock-agentcore invoke-agent-runtime --agent-runtime-arn <AgentRuntimeArn> --qualifier DEFAULT \
   --runtime-session-id "$(uuidgen)-$(uuidgen)" --runtime-user-id ops-001 \
   --content-type application/json --accept application/json \
   --payload "$(echo -n '{"prompt":"预测5号店商品12080084下周销量"}' | base64)" /dev/stdout
-
-# 分析师用 Claude Code 直连预测服务（命令见栈输出 McpProxyCommand）
 ```
 
-调用方 IAM 需要对 Runtime ARN 及 `ARN/*` 的 `bedrock-agentcore:InvokeAgentRuntime`，前端还需读数据桶 `charts/*`。
-**调 Agent 必须传 `runtimeUserId`**，否则 Agent 取不到大模型 Key。
+| 参数 | 含义 | 怎么取值 |
+|---|---|---|
+| `--runtime-session-id` | 会话标识。同一个 ID 连续调用 = 同一次对话，Agent 记住上下文；换 ID = 新会话 | 调用方自己生成的任意字符串，**至少 33 个字符**。示例用 `uuidgen`（macOS/Linux 自带的随机 UUID 命令）拼两个凑长度；业务系统里通常用"用户 ID + 会话序号"或数据库里的会话主键 |
+| `--runtime-user-id` | 调用用户的标识，**必填**（Runtime 据此给 Agent 注入身份令牌，Agent 才能从 Identity 取到大模型 Key） | 业务系统的用户名或工号，如 `store05-zhang` |
+| `--payload` | 请求体 JSON `{"prompt": "问题"}`，CLI 要求 base64 编码；用 SDK（boto3 等）直接传字节即可 | 见 `docs/技术部署指南.md` 的 Python 示例 |
+| `/dev/stdout` | 响应输出位置 | 返回 JSON 里 `result` 是回答正文，`tools` / `usage` / `total_ms` 是本轮工具调用、token 和耗时 |
+
+### 3. 分析师用 Claude Code / Kiro 直连预测服务
+
+不经过 Agent，直接把 Chronos-2 的三个预测工具挂进 AI 助手，适合自己准备好历史数据做分析的人。
+
+```bash
+# 前提：本机已安装 Claude Code 和 uv（提供 uvx），AWS 凭证对预测服务 ARN 有 bedrock-agentcore:InvokeAgentRuntime 权限
+# 命令在栈输出 McpProxyCommand 里已经拼好，复制执行即可，形如：
+claude mcp add --scope user chronos2-forecast -- uvx mcp-proxy-for-aws@latest \
+  'https://bedrock-agentcore.cn-northwest-1.amazonaws.com.cn/runtimes/<URL编码的预测服务ARN>/invocations?qualifier=DEFAULT' \
+  --service bedrock-agentcore --region cn-northwest-1
+```
+
+之后在 Claude Code 里直接提问，例如："用 chronos2-forecast 预测这组日销量未来 7 天：[30, 28, 35, …]"，助手会调用 `forecast` / `batch_forecast` / `forecast_with_covariates`。`mcp-proxy-for-aws` 在本机用 AWS 凭证做 SigV4 签名后转发，所以不需要密码，也没有公网入口。Kiro / Cursor 的 MCP 配置里把同一条命令写成 `command: uvx`、`args: [...]` 即可。
 
 ## 费用（宁夏区）
 
-按会话计费：一次 3 轮对话约 0.15 元（其中大模型约 0.10 元）；POC 10 人 × 5 次/天约 175 元/月；无人使用时接近零。详见 `docs/部署方案-客户版.md`。
+下面是**整套方案的全部费用**，不只是 AgentCore（单价来自中国区官网，用量为实测）：
+
+| 项目 | 计费方式 | 一次 3 轮对话 | 说明 |
+|---|---|---|---|
+| AgentCore Runtime ×2（Agent + 预测服务） | 按会话实际 vCPU / 内存按秒计费 | ≈ ¥0.05 | 无会话时为 0 |
+| AgentCore Code Interpreter | 同上（¥0.608/vCPU-h，¥0.064/GB-h） | ≈ ¥0.02 | 只在算补货量 / 画图时启动 |
+| 大模型（DeepSeek V4 Flash @ PPIO） | 按 token | ≈ ¥0.10 | 占总成本约 2/3，可换模型 |
+| AgentCore Identity | 经 Runtime 调用免费 | 0 | — |
+| Open-Meteo 天气 | 免费 | 0 | — |
+| **合计** | | **≈ ¥0.17** | |
+
+| 月度（22 个工作日） | AgentCore 部分 | 大模型 | 合计 |
+|---|---|---|---|
+| POC：10 人 × 5 次/天 | ≈ ¥80 | ≈ ¥115 | **≈ ¥195** |
+| 试运行：50 人 × 10 次/天 | ≈ ¥800 | ≈ ¥1,150 | **≈ ¥1,950** |
+| 每日全量跑批（约 9,500 组合，不经大模型） | ≈ ¥6 | 0 | ≈ ¥6 |
+
+固定费用：ECR 两个镜像约 1 GB（≈ ¥0.7/月）、Secrets Manager 1 个密文（≈ ¥2.8/月）、S3 数据与图表（< ¥1/月）、CloudWatch 日志与 Trace（免费额度内）。每次部署 / 升级一次 CodeBuild 构建约 10 分钟，约几元。对比原方案 GPU 端点常驻 ¥1,150～3,740/月。
 
 ## 中国区注意
 
