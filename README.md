@@ -29,6 +29,7 @@ AI 助手（Claude Code / Kiro）──mcp-proxy-for-aws──▶ Runtime②（�
 | `app_agent/` | 补货助手 Agent（`agent.py`）、天气 MCP（`weather_mcp.py`）、批量预测核心（`batch.py`）、业务因素/回测（`factors.py`）、保质期补货（`master.py`）、`Dockerfile` |
 | `frontend/app.py` | Streamlit 聊天前端（本机 / 内网运行）：对话、上传 Excel、下载报表 |
 | `tools/batch_forecast.py` | 命令行批量预测（各店 Top-N → Excel），供定时任务 |
+| `tools/export_from_db.py` | 数据库 → parquet → S3 的定时导出模板（生产数据管道） |
 | `tools/mock_master_data.py`、`iac/prepare_master.py` | 模拟 / 转换商品主数据与库存快照（保质期、到货周期、箱规、库存） |
 | `tests/` | 预测服务基准、Agent 对话测试、测试用例生成 |
 | `docs/` | 客户版部署方案、技术指南、销售数据格式说明、两阶段验证报告、`architecture/` 架构图（PNG + 交互式 HTML） |
@@ -59,7 +60,7 @@ pip install -r frontend/requirements.txt
 streamlit run frontend/app.py -- --agent-arn <AgentRuntimeArn> --data-bucket <DataBucket> --region cn-northwest-1
 ```
 
-- 聊天提问；图表和 Excel 报表自动从 S3 取回显示 / 提供下载
+- 聊天提问；图表和 Excel 报表自动从 S3 取回显示 / 提供下载；处理中可点"停止"（结束云端会话，不再计费），"撤回并修改"可改上一条重发；侧栏有名词解释
 - 侧栏"上传销售 Excel"：转换校验后覆盖 `data/sales_daily.parquet`，Agent 30 秒内自动切到新数据（S3 开了版本控制，可回退）
 - 批量：问"所有门店热销 Top10 商品下周销量批量预测，生成报表"，Agent 一次调用 `batch_forecast` 生成 Excel（6 店 × 10 品约 3 秒）
 - 业务因素：问"5 号店 12080084 下周五到周日做促销价，销量多少"，Agent 把促销计划 + 节假日（离线日历）+ 天气 + 价格作为协变量预测并给出基线对比
