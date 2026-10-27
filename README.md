@@ -30,7 +30,7 @@ AI 助手（Claude Code / Kiro）──mcp-proxy-for-aws──▶ Runtime②（�
 | `frontend/app.py` | Streamlit 聊天前端（本机 / 内网运行）：对话、上传 Excel、下载报表 |
 | `tools/batch_forecast.py` | 命令行批量预测（各店 Top-N → Excel），供定时任务 |
 | `tests/` | 预测服务基准、Agent 对话测试、测试用例生成 |
-| `docs/` | 客户版部署方案、技术指南、两阶段验证报告、`architecture/` 架构图（PNG + 交互式 HTML） |
+| `docs/` | 客户版部署方案、技术指南、销售数据格式说明、两阶段验证报告、`architecture/` 架构图（PNG + 交互式 HTML） |
 
 ## 部署（约 25 分钟）
 
@@ -38,7 +38,7 @@ AI 助手（Claude Code / Kiro）──mcp-proxy-for-aws──▶ Runtime②（�
 **不需要本机 Docker**，镜像由 CodeBuild 在区域内构建。
 
 ```bash
-python iac/prepare_data.py 门店销售数据.xlsx data/sales_daily.parquet
+python iac/prepare_data.py 门店销售数据.xlsx data/sales_daily.parquet   # Excel 格式要求见 docs/销售数据格式说明.md
 LLM_API_KEY='sk_xxx' bash iac/deploy.sh https://github.com/<you>/chronos2-agentcore-cn.git data/sales_daily.parquet
 ```
 
