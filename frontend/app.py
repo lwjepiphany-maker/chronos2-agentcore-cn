@@ -34,6 +34,18 @@ session = boto3.Session(profile_name=args.profile, region_name=args.region)
 rt = session.client("bedrock-agentcore")
 s3 = session.client("s3")
 
+
+@st.cache_data(ttl=600, show_spinner=False)
+def runtime_model_info(arn: str) -> dict:
+    """从 Runtime 配置读大模型信息（需要 bedrock-agentcore:GetAgentRuntime 权限）；没权限时返回空，改用响应里的 model 字段。"""
+    try:
+        rid = arn.rsplit("/", 1)[-1]
+        env = session.client("bedrock-agentcore-control").get_agent_runtime(agentRuntimeId=rid).get("environmentVariables", {})
+        return {"model": env.get("LLM_MODEL"), "endpoint": env.get("LLM_BASE_URL", "").split("//")[-1].split("/")[0],
+                "city": env.get("DEFAULT_CITY")}
+    except Exception:  # noqa: BLE001
+        return {}
+
 S3_PNG = re.compile(r"s3://([a-z0-9.\-]+)/(\S+?\.png)")
 S3_XLSX = re.compile(r"s3://([a-z0-9.\-]+)/(\S+?\.xlsx)")
 EXAMPLES = ["预测5号店商品12080084下周销量",
@@ -106,6 +118,13 @@ with st.sidebar:
         if st.button(ex, use_container_width=True):
             st.session_state.pending = ex
     st.divider()
+    info = runtime_model_info(args.agent_arn) or st.session_state.get("model_info", {})
+    st.markdown("**大模型**")
+    if info.get("model"):
+        st.markdown(f"`{info['model']}`  \n接口：`{info.get('endpoint', '')}`")
+    else:
+        st.caption("首轮对话后显示")
+    st.markdown("**预测模型**  \n`Chronos-2`（CPU，AgentCore Runtime）")
     st.markdown(f"Region `{args.region}`  \nAgent `…{args.agent_arn[-32:]}`")
 
 st.markdown("### 门店销量预测与补货建议")
@@ -131,9 +150,11 @@ if prompt:
             try:
                 body = invoke(prompt)
                 text = body.get("result", "")
+                if body.get("model"):
+                    st.session_state.model_info = {"model": body["model"], "endpoint": body.get("model_endpoint", "")}
                 imgs = fetch_charts(text)
                 files = fetch_reports(text)
-                meta = {"端到端耗时 ms": round((time.time() - t0) * 1000), "Agent 耗时 ms": body.get("total_ms"),
+                meta = {"大模型": body.get("model"), "端到端耗时 ms": round((time.time() - t0) * 1000), "Agent 耗时 ms": body.get("total_ms"),
                         "工具调用（会话累计）": body.get("tools"), "token": body.get("usage")}
             except Exception as e:  # noqa: BLE001
                 text, imgs, files, meta = f"调用失败：{e}", [], [], None

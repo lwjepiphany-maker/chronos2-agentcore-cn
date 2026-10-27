@@ -36,6 +36,8 @@ from strands.tools.mcp import MCPClient
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("chronos2-agent")
+os.environ.setdefault("TZ", "Asia/Shanghai")   # 报表、图表文件名用北京时间
+time.tzset()
 
 REGION = os.environ.get("AWS_REGION", "cn-northwest-1")
 CHRONOS_RUNTIME_ARN = os.environ["CHRONOS_RUNTIME_ARN"]
@@ -500,6 +502,7 @@ def invoke(payload: dict, context=None) -> dict:
     tools_used = [{"tool": name, "calls": tm.call_count, "ms": round(tm.total_time * 1000)}
                   for name, tm in m.tool_metrics.items()]
     resp = {"result": str(result).strip(), "usage": dict(m.accumulated_usage),
+            "model": LLM_MODEL, "model_endpoint": urllib.parse.urlparse(LLM_BASE_URL).netloc,
             "llm_ms": round(sum(m.accumulated_metrics.values()) if isinstance(m.accumulated_metrics, dict)
                             else m.accumulated_metrics.get("latencyMs", 0)),
             "tools": tools_used, "total_ms": round((time.time() - t0) * 1000),
