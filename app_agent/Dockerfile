@@ -8,7 +8,7 @@ ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PIP_DEFAULT_TIMEOUT=120 PIP_RETRIES=5
 COPY app_agent/requirements.txt /tmp/requirements.txt
 RUN pip install --index-url https://mirrors.aliyun.com/pypi/simple --extra-index-url https://mirrors.cloud.tencent.com/pypi/simple -r /tmp/requirements.txt
 
-COPY app_agent/agent.py app_agent/weather_mcp.py /app/
+COPY app_agent/agent.py app_agent/weather_mcp.py app_agent/batch.py /app/
 RUN useradd -m -u 1000 app
 USER app
 WORKDIR /app
