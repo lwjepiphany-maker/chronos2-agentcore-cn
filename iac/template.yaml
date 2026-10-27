@@ -279,7 +279,7 @@ Resources:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
-                Action: codebuild:StartBuild
+                Action: [codebuild:StartBuild, codebuild:BatchGetBuilds]
                 Resource: !GetAtt BuildProject.Arn
               - Effect: Allow
                 Action: ecr:DescribeImages
@@ -294,7 +294,7 @@ Resources:
       FunctionName: !Sub "${AWS::StackName}-build-trigger"
       Runtime: python3.12
       Handler: index.handler
-      Timeout: 60
+      Timeout: 240
       Role: !GetAtt BuildTriggerRole.Arn
       Environment:
         Variables:
@@ -322,12 +322,18 @@ Resources:
               ]
               try:
                   if event["RequestType"] == "Delete":
-                      # best effort: remove the Identity provider; respond right away so stack deletion isn't blocked
+                      # remove the Identity provider via a short CodeBuild run; wait for it so CloudFormation
+                      # does not delete the CodeBuild project underneath it. Best effort: never block stack deletion.
                       try:
-                          cb.start_build(projectName=os.environ["PROJECT_NAME"],
-                                         environmentVariablesOverride=[e for e in env("delete") if e["name"] == "MODE"])
+                          import time
+                          bid = cb.start_build(projectName=os.environ["PROJECT_NAME"],
+                                               environmentVariablesOverride=[e for e in env("delete") if e["name"] == "MODE"])["build"]["id"]
+                          for _ in range(50):
+                              time.sleep(3)
+                              if cb.batch_get_builds(ids=[bid])["builds"][0]["buildStatus"] != "IN_PROGRESS":
+                                  break
                       except Exception as e:
-                          print("delete build not started:", e)
+                          print("delete build problem (ignored):", e)
                       respond(event, "SUCCESS")
                       return
                   props = event["ResourceProperties"]
