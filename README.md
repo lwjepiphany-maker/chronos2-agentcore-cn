@@ -44,7 +44,7 @@ AI 助手（Claude Code / Kiro）──mcp-proxy-for-aws──▶ Runtime②（�
 ```bash
 # 0. 取代码，装数据转换所需的 Python 包
 git clone https://github.com/lwjepiphany-maker/chronos2-agentcore-cn.git && cd chronos2-agentcore-cn
-pip install pandas pyarrow openpyxl boto3
+pip install -i https://mirrors.aliyun.com/pypi/simple pandas pyarrow openpyxl boto3
 
 # 1. 销售 Excel → parquet（格式要求见 docs/销售数据格式说明.md）
 python iac/prepare_data.py 门店销售数据.xlsx data/sales_daily.parquet
@@ -57,7 +57,7 @@ python tools/mock_master_data.py --parquet data/sales_daily.parquet --out data/m
 #    有真实数据时：python iac/prepare_master.py 商品主数据与库存.xlsx data/master && aws s3 cp data/master/ s3://<DataBucket>/master/ --recursive
 
 # 4. 启动前端（本机或内网），<AgentRuntimeArn> / <DataBucket> 取自第 2 步输出
-pip install -r frontend/requirements.txt
+pip install -i https://mirrors.aliyun.com/pypi/simple -r frontend/requirements.txt
 streamlit run frontend/app.py -- --agent-arn <AgentRuntimeArn> --data-bucket <DataBucket> --region cn-northwest-1
 ```
 
@@ -74,7 +74,7 @@ streamlit run frontend/app.py -- --agent-arn <AgentRuntimeArn> --data-bucket <Da
 ### 1. 前端（门店运营人员，本机或内网）
 
 ```bash
-pip install -r frontend/requirements.txt
+pip install -i https://mirrors.aliyun.com/pypi/simple -r frontend/requirements.txt
 streamlit run frontend/app.py -- --agent-arn <AgentRuntimeArn> --data-bucket <DataBucket> --region cn-northwest-1
 ```
 
