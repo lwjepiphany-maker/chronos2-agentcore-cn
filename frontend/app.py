@@ -36,6 +36,49 @@ st.set_page_config(page_title="销量预测补货助手", page_icon="📦", layo
 session = boto3.Session(profile_name=args.profile, region_name=args.region)
 rt = session.client("bedrock-agentcore")
 s3 = session.client("s3")
+xray = session.client("xray")
+CONSOLE = f"https://{args.region}.console.amazonaws.cn/cloudwatch/home?region={args.region}#xray:traces/"
+
+
+def render_trace(trace_id: str, key: str):
+    """从 X-Ray 拉本轮 trace，渲染成瀑布图（AgentCore Observability 采集的 span）。trace 通常在回答后 30~90 秒内可查。"""
+    st.markdown(f"[在 CloudWatch 控制台打开调用链 ↗]({CONSOLE}{trace_id})")
+    if not st.button("拉取调用链瀑布图", key=f"trace-{key}"):
+        return
+    try:
+        traces = xray.batch_get_traces(TraceIds=[trace_id]).get("Traces", [])
+    except Exception as e:  # noqa: BLE001
+        st.warning(f"查询失败：{e}"); return
+    if not traces or not traces[0].get("Segments"):
+        st.info("调用链还在上报中（一般 30～90 秒），稍后再点。"); return
+    rows = []
+
+    def walk(seg, depth):
+        st_, en = seg.get("start_time"), seg.get("end_time")
+        if st_ and en:
+            rows.append((st_, depth, seg.get("name", "?"), (en - st_) * 1000))
+        for c in seg.get("subsegments", []):
+            walk(c, depth + 1)
+
+    for sg in traces[0]["Segments"]:
+        walk(json.loads(sg["Document"]), 0)
+    rows.sort(key=lambda r: r[0])
+    t0, t_end = rows[0][0], max(r[0] + r[3] / 1000 for r in rows)
+    total = max(1e-3, t_end - t0)
+    name_map = {"api.ppinfra.com": "大模型请求", "chat": "大模型生成", "execute_event_loop_cycle": "Agent 推理轮次",
+                "invoke_agent Strands Agents": "Agent 处理", "BedrockAgentCore": "AgentCore 调用（预测 / 沙箱）",
+                "UnknownRemoteService": "预测服务（MCP）"}
+    st.caption(f"trace {trace_id} · 总时长 {total:.1f} s · {len(rows)} 个 span")
+    for st_, depth, name, ms in rows:
+        label = name_map.get(name, name)
+        label = label if name.startswith("execute_tool") is False else "工具：" + name.replace("execute_tool ", "")
+        left = (st_ - t0) / total * 100; width = max(0.5, ms / 1000 / total * 100)
+        st.markdown(
+            f'<div style="display:flex;align-items:center;font-size:12px;margin:1px 0">'
+            f'<div style="width:260px;padding-left:{depth * 12}px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="{name}">{label}</div>'
+            f'<div style="flex:1;position:relative;height:14px;background:#f1f3f5;border-radius:3px">'
+            f'<div style="position:absolute;left:{left:.1f}%;width:{width:.1f}%;height:14px;border-radius:3px;background:{"#ff9900" if "大模型" in label else ("#1d8102" if label.startswith("工具") else "#5a6c7d")}"></div></div>'
+            f'<div style="width:70px;text-align:right">{ms:,.0f} ms</div></div>', unsafe_allow_html=True)
 
 
 @st.cache_resource(show_spinner=False)
@@ -171,7 +214,10 @@ for i, m in enumerate(st.session_state.messages):
             st.download_button(f"下载报表 {name}", data, file_name=name, key=f"dl-{i}-{j}")
         if m.get("meta"):
             with st.expander("调用详情", expanded=False):
-                st.json(m["meta"])
+                st.json({k: v for k, v in m["meta"].items() if k != "trace_id"})
+                if m["meta"].get("trace_id"):
+                    st.markdown("**调用链（AgentCore Observability → CloudWatch）**")
+                    render_trace(m["meta"]["trace_id"], key=str(i))
 
 # ----------------------------------------------------------------- 进行中的请求：停止按钮 + 轮询
 if busy:
@@ -194,7 +240,7 @@ if busy:
                 st.session_state.model_info = {"model": body["model"], "endpoint": body.get("model_endpoint", "")}
             imgs, files = fetch_files(text)
             meta = {"大模型": body.get("model"), "端到端耗时 ms": round((time.time() - started) * 1000), "Agent 耗时 ms": body.get("total_ms"),
-                    "工具调用（会话累计）": body.get("tools"), "token": body.get("usage")}
+                    "工具调用（会话累计）": body.get("tools"), "token": body.get("usage"), "trace_id": body.get("trace_id")}
         except Exception as e:  # noqa: BLE001
             text, imgs, files, meta = f"调用失败：{e}", [], [], None
         st.session_state.messages.append({"role": "assistant", "content": text, "images": imgs, "files": files, "meta": meta})
