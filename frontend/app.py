@@ -61,7 +61,10 @@ def render_trace(trace_id: str, key: str):
             walk(c, depth + 1)
 
     for sg in traces[0]["Segments"]:
-        walk(json.loads(sg["Document"]), 0)
+        doc = json.loads(sg["Document"])
+        if doc.get("inferred"):   # X-Ray 为远端服务推断出的顶层段，与子段重复，跳过
+            continue
+        walk(doc, 0)
     rows.sort(key=lambda r: r[0])
     t0, t_end = rows[0][0], max(r[0] + r[3] / 1000 for r in rows)
     total = max(1e-3, t_end - t0)
