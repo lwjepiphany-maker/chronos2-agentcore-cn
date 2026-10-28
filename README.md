@@ -23,7 +23,7 @@ AI 助手（Claude Code / Kiro）──mcp-proxy-for-aws──▶ Runtime②（�
 | 路径 | 内容 |
 |---|---|
 | `iac/template.yaml` | **一个 CloudFormation 模板部署全部**：CodeBuild 从本仓库构建两个 arm64 镜像 → ECR → 两个 AgentCore Runtime、IAM 角色、数据桶、Identity 密钥、Transaction Search |
-| `iac/deploy.sh` | 一键脚本：建栈 → 上传数据 → 打印调用方式 |
+| `iac/deploy.sh` / `iac/deploy.ps1` | 一键脚本（macOS/Linux / Windows PowerShell）：建栈 → 上传数据 → 打印调用方式 |
 | `iac/prepare_data.py` | 销售 Excel → parquet |
 | `app/` | Chronos-2 预测 MCP Server（`server.py`、`Dockerfile`） |
 | `app_agent/` | 补货助手 Agent（`agent.py`）、天气 MCP（`weather_mcp.py`）、批量预测核心（`batch.py`）、业务因素/回测（`factors.py`）、保质期补货（`master.py`）、`Dockerfile` |
@@ -64,6 +64,16 @@ streamlit run frontend/app.py -- --agent-arn <AgentRuntimeArn> --data-bucket <Da
 可选环境变量（第 2 步前 export）：`STORE_CITY`（门店城市，默认西安）、`LLM_BASE_URL` / `LLM_MODEL`（默认 PPIO 的 DeepSeek V4 Flash）、
 `IMAGE_TAG`（改代码后换个值重跑即滚动升级，只重建改动过的镜像，约 6 分钟）、`PREFIX`（资源名前缀，默认 chronos2）、
 `WEIGHTS_URL`（模型权重地址，默认 ModelScope 直链）、`GITHUB_TOKEN`（私有仓库）。
+
+**Windows 部署机**：第 2 步改用 PowerShell 脚本（其余步骤相同，命令里的 `/` 换成 `\`）：
+
+```powershell
+$env:LLM_API_KEY = 'sk_xxx'
+.\iac\deploy.ps1 -Source https://github.com/lwjepiphany-maker/chronos2-agentcore-cn.git -DataFile data\sales_daily.parquet
+# 可选：-StoreCity 西安 -LlmBaseUrl ... -LlmModel ... -ImageTag v2 -Prefix chronos2
+```
+
+或者用 Git for Windows 自带的 Git Bash 直接运行 `bash iac/deploy.sh ...`。
 
 离线部署：把仓库打成 zip 放到客户 S3，第 2 步第一个参数改为 `s3://<桶>/src.zip`。
 
