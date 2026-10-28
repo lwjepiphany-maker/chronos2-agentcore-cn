@@ -391,6 +391,43 @@ def backtest(store: int, skus: list[int] | None = None, horizon: int = 7, folds:
 
 
 @tool
+def data_requirements(topic: str = "all") -> dict:
+    """说明系统需要哪些数据、什么格式、怎么上传、当前已有哪些。用户问"需要准备什么数据 / 数据怎么上传 / 库存数据格式 / 促销数据怎么给"时调用。
+
+    Args:
+        topic: all / sales（销售数据）/ master（商品主数据与库存）/ promo（促销与节假日）
+    """
+    status = {}
+    try:
+        df = _Data.ensure()
+        extra = [c for c in ("holiday", "promo_type", "price", "brand", "abc") if c in df.columns]
+        status["sales"] = f"已有：{len(df)} 行，{df.date.min().date()} ~ {df.date.max().date()}，{df.store.nunique()} 家门店，{df.sku.nunique()} 个商品" + (f"，含附加特征 {extra}" if extra else "，仅基础列（无促销/节假日/价格）")
+    except Exception as e:  # noqa: BLE001
+        status["sales"] = f"尚未上传（{e}）"
+    if MASTER:
+        MASTER.ensure()
+        src = (MASTER.products["source"].iloc[0] if MASTER.products is not None and "source" in MASTER.products else None)
+        status["master"] = ("无" if MASTER.products is None else f"商品主数据 {len(MASTER.products)} 行" + ("（演示用模拟数据）" if src == "mock" else "（客户数据）"))
+        status["inventory"] = ("无" if MASTER.inventory is None else f"库存快照 {len(MASTER.inventory)} 行" + ("（演示用模拟数据）" if src == "mock" else ""))
+    spec = {
+        "sales": {"用途": "所有预测的基础", "格式": "Excel，每行一天一店一品。必需列：记账日期、门店代码、商品代码、销售数量；可选：门店类型、天气、温度、星期、节假日、促销类型、促销数量、优惠金额、促销单据类别、门店售价、商品品牌、门店商品ABC属性",
+                  "要求": "最近一段连续日期 ≥ 60 天；无销售的日期不用补零；建议每日或每周全量覆盖",
+                  "上传": "前端侧栏「上传销售 Excel」，或命令行 iac/prepare_data.py 后放到数据桶 data/sales_daily.parquet；数据库场景用 tools/export_from_db.py 定时导出。上传后 30 秒内生效",
+                  "参考": "docs/销售数据格式说明.md 第一~四节"},
+        "master": {"用途": "补货计算（保质期、到货周期、箱规、起订量）和库存扣减",
+                   "格式": "Excel 两个 sheet。商品主数据：商品代码、保质期(天)、到货周期(天)、补货间隔(天)、箱规、起订量(箱)，可选品牌/品类。库存快照：门店代码、商品代码、现有库存、在途、最早到期日、快照日期",
+                   "上传": "iac/prepare_master.py 转换后放到数据桶 master/（products.parquet、inventory.parquet），60 秒内生效；没有时可用 tools/mock_master_data.py 生成模拟数据",
+                   "参考": "docs/销售数据格式说明.md 第五节"},
+        "promo": {"用途": "带业务因素的预测", "历史促销": "放在销售数据的促销类型 / 促销数量 / 优惠金额 列里，同一天多种活动取第一种",
+                  "未来促销": "目前在提问时说明（如「5月29日到31日促销价」）；如能提供未来促销排期表可自动代入",
+                  "节假日": "系统内置中国法定节假日日历，不需要提供"},
+    }
+    out = {"current": status}
+    out.update(spec if topic == "all" else {topic: spec.get(topic, spec)})
+    return out
+
+
+@tool
 def inventory_status(store: int, sku: int) -> dict:
     """查商品主数据（品类、保质期、到货周期、箱规、起订量）和门店库存快照（现有库存、在途、最早到期日），
     并给出按近 14 天日均可售天数。用户问"库存多少 / 还能卖几天 / 保质期多长"时调用。
@@ -653,6 +690,8 @@ SYSTEM_PROMPT = f"""你是便利店连锁的补货助手，服务门店运营人
 - 用户问准不准、准确率、误差时用 backtest，汇报整体 WAPE / 准确率和最好最差的商品，说明这是历史回测结果。
 - 用户要多门店 / 热销商品的批量预测或补货清单时，调用 forecast_top_skus（一次完成并生成 Excel），只汇报每店合计和前几名，并给出报表的 S3 位置。
 - 用户只说商品名没有商品代码时，用 list_top_skus 帮用户定位，或请用户提供商品代码。
+- 用户问需要准备什么数据、数据格式、怎么上传、现在有什么数据时，用 data_requirements，按用户角色（运营/IT）给出清晰的清单和上传方式。
+- 工具报"销售数据未就位"或主数据缺失时，不要重试，直接告诉用户缺什么数据、格式和上传方式（可调 data_requirements）。
 
 表达方式（读者是门店运营人员，不是数据分析师）：
 - 先给结论再给依据：第一句直接说"下周预计卖约 N 件，建议备 M 件（最多不超过 K 件）"。
@@ -701,7 +740,7 @@ def _get_agent() -> Agent:
             last_date = f"未知（销售数据尚未上传到 {DATA_URI}：{e}）"
         _agent = Agent(model=model,
                        tools=[forecast_sku, forecast_sku_with_weather, forecast_sku_with_factors, forecast_top_skus,
-                              backtest, replenishment_plan, inventory_status, list_top_skus, recent_sales,
+                              backtest, replenishment_plan, inventory_status, data_requirements, list_top_skus, recent_sales,
                               run_python, plot_forecast] + weather.list_tools_sync(),
                        system_prompt=SYSTEM_PROMPT.replace("{last_date}", last_date), callback_handler=None)
     return _agent
