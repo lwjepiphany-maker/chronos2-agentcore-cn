@@ -746,6 +746,19 @@ def _get_agent() -> Agent:
     return _agent
 
 
+def _current_trace_id() -> str | None:
+    """取 ADOT 自动注入的当前 span 的 trace id，并转成 X-Ray 格式 1-<8位十六进制时间>-<24位>。未开追踪时返回 None。"""
+    try:
+        from opentelemetry import trace as _ot
+        ctx = _ot.get_current_span().get_span_context()
+        if not ctx or not ctx.trace_id:
+            return None
+        h = format(ctx.trace_id, "032x")
+        return f"1-{h[:8]}-{h[8:]}"
+    except Exception:  # noqa: BLE001
+        return None
+
+
 @app.entrypoint
 def invoke(payload: dict, context=None) -> dict:
     prompt = payload.get("prompt", "")
@@ -757,6 +770,7 @@ def invoke(payload: dict, context=None) -> dict:
                   for name, tm in m.tool_metrics.items()]
     resp = {"result": str(result).strip(), "usage": dict(m.accumulated_usage),
             "model": LLM_MODEL, "model_endpoint": urllib.parse.urlparse(LLM_BASE_URL).netloc,
+            "trace_id": _current_trace_id(),   # 本轮调用链的 X-Ray trace id，前端可据此拉取瀑布图
             "llm_ms": round(sum(m.accumulated_metrics.values()) if isinstance(m.accumulated_metrics, dict)
                             else m.accumulated_metrics.get("latencyMs", 0)),
             "tools": tools_used, "total_ms": round((time.time() - t0) * 1000),
