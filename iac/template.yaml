@@ -147,6 +147,14 @@ Resources:
               - Effect: Allow
                 Action: [xray:GetTraceSegmentDestination, xray:UpdateTraceSegmentDestination, xray:GetIndexingRules, xray:UpdateIndexingRule, logs:PutResourcePolicy, logs:DescribeResourcePolicies]
                 Resource: "*"
+              # UpdateTraceSegmentDestination creates these two log groups on first enablement
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:DescribeLogGroups]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans:*"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/application-signals/data"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/application-signals/data:*"
 
   BuildProject:
     Type: AWS::CodeBuild::Project
@@ -191,7 +199,9 @@ Resources:
                     echo "==> clone $REPO_URL@$GIT_REF"
                     CLONE_URL="$REPO_URL"
                     [ "$GITHUB_TOKEN" != "none" ] && CLONE_URL=$(echo "$REPO_URL" | sed "s#https://#https://${GITHUB_TOKEN}@#")
-                    git clone --depth 1 --branch "$GIT_REF" "$CLONE_URL" src && cd src
+                    git clone --depth 1 --branch "$GIT_REF" "$CLONE_URL" src \
+                      || { echo "ERROR: git clone failed. CodeBuild may not reach the Git host from this region; zip the repo to S3 and deploy with SourceS3Uri (deploy.sh first argument s3://bucket/src.zip)."; false; }
+                    cd src
                   fi
 
                   echo "==> model weights"
@@ -231,15 +241,17 @@ Resources:
                     aws bedrock-agentcore-control create-api-key-credential-provider --name "$PROVIDER_NAME" --api-key "$LLM_API_KEY" >/dev/null
                   fi
 
-                  echo "==> CloudWatch Transaction Search (for AgentCore Observability traces)"
+                  echo "==> CloudWatch Transaction Search (for AgentCore Observability traces; best effort, account-level)"
                   LG="arn:${PARTITION}:logs:${AWS_REGION}:${ACCOUNT_ID}:log-group"
                   printf '{"Version":"2012-10-17","Statement":[{"Sid":"TransactionSearchXRayAccess","Effect":"Allow","Principal":{"Service":"xray.amazonaws.com"},"Action":"logs:PutLogEvents","Resource":["%s:aws/spans:*","%s:/aws/application-signals/data:*"],"Condition":{"ArnLike":{"aws:SourceArn":"arn:%s:xray:%s:%s:*"},"StringEquals":{"aws:SourceAccount":"%s"}}}]}' \
                     "$LG" "$LG" "$PARTITION" "$AWS_REGION" "$ACCOUNT_ID" "$ACCOUNT_ID" > /tmp/xray-policy.json
-                  aws logs put-resource-policy --policy-name TransactionSearchXRayAccess --policy-document file:///tmp/xray-policy.json >/dev/null
-                  if [ "$(aws xray get-trace-segment-destination --query Destination --output text)" != "CloudWatchLogs" ]; then
-                    aws xray update-trace-segment-destination --destination CloudWatchLogs >/dev/null
+                  if aws logs put-resource-policy --policy-name TransactionSearchXRayAccess --policy-document file:///tmp/xray-policy.json >/dev/null \
+                     && { [ "$(aws xray get-trace-segment-destination --query Destination --output text)" = "CloudWatchLogs" ] || aws xray update-trace-segment-destination --destination CloudWatchLogs >/dev/null; }; then
+                    aws xray update-indexing-rule --name Default --rule '{"Probabilistic":{"DesiredSamplingPercentage":100}}' >/dev/null || true
+                    echo "Transaction Search enabled"
+                  else
+                    echo "WARNING: could not enable CloudWatch Transaction Search (account policy / permission). Deployment continues; traces will not be visible until an admin runs: aws xray update-trace-segment-destination --destination CloudWatchLogs"
                   fi
-                  aws xray update-indexing-rule --name Default --rule '{"Probabilistic":{"DesiredSamplingPercentage":100}}' >/dev/null || true
 
                   signal SUCCESS "images pushed with tag $IMAGE_TAG"
       Environment:
