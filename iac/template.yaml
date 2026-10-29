@@ -1,9 +1,10 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
   Chronos-2 sales forecasting on Amazon Bedrock AgentCore (China regions).
-  One stack builds both container images from a GitHub repo via CodeBuild, then creates
-  the Chronos-2 MCP Runtime, the replenishment Agent Runtime, the data bucket, IAM roles,
-  the LLM API-key credential provider (AgentCore Identity) and enables CloudWatch Transaction Search.
+  One stack builds both container images (from a Git repo or an S3 zip) via CodeBuild into ECR repositories
+  that outlive the stack, then creates the Chronos-2 MCP Runtime, the replenishment Agent Runtime, the data
+  bucket, IAM roles, the LLM API-key credential provider (AgentCore Identity) and enables CloudWatch
+  Transaction Search (best effort).
 
 Parameters:
   GitRepoUrl:
@@ -43,6 +44,12 @@ Parameters:
     Type: String
     NoEcho: true
     Description: API key of the OpenAI-compatible LLM endpoint (stored in AgentCore Identity)
+  LlmKeyFingerprint:
+    Type: String
+    Default: ""
+    Description: >-
+      Short SHA-256 prefix of LlmApiKey, computed by deploy.sh / deploy.ps1. Changing it (i.e. rotating the key)
+      triggers a short CodeBuild run that writes the new key into AgentCore Identity without rebuilding images.
   LlmBaseUrl:
     Type: String
     Default: https://api.ppinfra.com/v3/openai
@@ -82,20 +89,9 @@ Resources:
         - Key: Project
           Value: !Ref AWS::StackName
 
-  ChronosRepo:
-    Type: AWS::ECR::Repository
-    Properties:
-      RepositoryName: !Sub "${RuntimeNamePrefix}-forecast"
-      EmptyOnDelete: true
-      ImageScanningConfiguration:
-        ScanOnPush: true
-  AgentRepo:
-    Type: AWS::ECR::Repository
-    Properties:
-      RepositoryName: !Sub "${RuntimeNamePrefix}-agent"
-      EmptyOnDelete: true
-      ImageScanningConfiguration:
-        ScanOnPush: true
+  # ECR repositories <prefix>-forecast / <prefix>-agent are created idempotently by the CodeBuild run and are
+  # deliberately NOT stack resources: a failed or deleted stack must not throw away 30+ minutes of image builds.
+  # Full cleanup: aws ecr delete-repository --force --repository-name <prefix>-forecast (and -agent).
 
   # The LLM key and git token are handed to CodeBuild as SECRETS_MANAGER env vars so they never
   # appear in the CodeBuild console or logs. CodeBuild copies the key into AgentCore Identity.
@@ -127,8 +123,10 @@ Resources:
                 Action: ecr:GetAuthorizationToken
                 Resource: "*"
               - Effect: Allow
-                Action: [ecr:BatchCheckLayerAvailability, ecr:CompleteLayerUpload, ecr:InitiateLayerUpload, ecr:PutImage, ecr:UploadLayerPart, ecr:BatchGetImage, ecr:GetDownloadUrlForLayer, ecr:DescribeImages]
-                Resource: [!GetAtt ChronosRepo.Arn, !GetAtt AgentRepo.Arn]
+                Action: [ecr:CreateRepository, ecr:DescribeRepositories, ecr:PutImageScanningConfiguration, ecr:TagResource, ecr:BatchCheckLayerAvailability, ecr:CompleteLayerUpload, ecr:InitiateLayerUpload, ecr:PutImage, ecr:UploadLayerPart, ecr:BatchGetImage, ecr:GetDownloadUrlForLayer, ecr:DescribeImages]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${RuntimeNamePrefix}-forecast"
+                  - !Sub "arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${RuntimeNamePrefix}-agent"
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Ref BuildSecrets
@@ -184,9 +182,16 @@ Resources:
                   GITHUB_TOKEN=$(echo "$BUILD_SECRETS" | python3 -c 'import json,sys;print(json.load(sys.stdin)["github_token"])')
 
                   if [ "$MODE" = "delete" ]; then
+                    # ECR repositories and images are kept on purpose (see template comment); only the Identity provider goes
                     aws bedrock-agentcore-control delete-api-key-credential-provider --name "$PROVIDER_NAME" || true
                     exit 0
                   fi
+
+                  if [ "$MODE" = "build" ]; then
+                  for r in "${CHRONOS_REPO_URI##*/}" "${AGENT_REPO_URI##*/}"; do
+                    aws ecr describe-repositories --repository-names "$r" >/dev/null 2>&1 \
+                      || { echo "==> create ECR repository $r"; aws ecr create-repository --repository-name "$r" --image-scanning-configuration scanOnPush=true >/dev/null; }
+                  done
 
                   if [ -n "$SOURCE_S3_URI" ]; then
                     echo "==> fetch source zip $SOURCE_S3_URI"
@@ -233,6 +238,9 @@ Resources:
                   }
                   build_or_reuse "$CHRONOS_REPO_URI" "src-$(content_hash app)" app/Dockerfile
                   build_or_reuse "$AGENT_REPO_URI" "src-$(content_hash app_agent)" app_agent/Dockerfile
+                  else
+                    echo "==> MODE=$MODE: images for tag $IMAGE_TAG already exist, skipping source/weights/build"
+                  fi
 
                   echo "==> LLM API key -> AgentCore Identity provider $PROVIDER_NAME"
                   if aws bedrock-agentcore-control get-api-key-credential-provider --name "$PROVIDER_NAME" >/dev/null 2>&1; then
@@ -253,7 +261,7 @@ Resources:
                     echo "WARNING: could not enable CloudWatch Transaction Search (account policy / permission). Deployment continues; traces will not be visible until an admin runs: aws xray update-trace-segment-destination --destination CloudWatchLogs"
                   fi
 
-                  signal SUCCESS "images pushed with tag $IMAGE_TAG"
+                  signal SUCCESS "mode=$MODE tag=$IMAGE_TAG"
       Environment:
         Type: ARM_CONTAINER
         ComputeType: BUILD_GENERAL1_LARGE
@@ -266,8 +274,8 @@ Resources:
           - { Name: GIT_REF, Value: !Ref GitRef }
           - { Name: WEIGHTS_URL, Value: !Ref ModelWeightsBaseUrl }
           - { Name: IMAGE_TAG, Value: !Ref ImageTag }
-          - { Name: CHRONOS_REPO_URI, Value: !GetAtt ChronosRepo.RepositoryUri }
-          - { Name: AGENT_REPO_URI, Value: !GetAtt AgentRepo.RepositoryUri }
+          - { Name: CHRONOS_REPO_URI, Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.${AWS::URLSuffix}/${RuntimeNamePrefix}-forecast" }
+          - { Name: AGENT_REPO_URI, Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.${AWS::URLSuffix}/${RuntimeNamePrefix}-agent" }
           - { Name: PROVIDER_NAME, Value: !Sub "${RuntimeNamePrefix}-llm-key" }
           - { Name: PARTITION, Value: !Ref AWS::Partition }
           - { Name: ACCOUNT_ID, Value: !Ref AWS::AccountId }
@@ -295,7 +303,9 @@ Resources:
                 Resource: !GetAtt BuildProject.Arn
               - Effect: Allow
                 Action: ecr:DescribeImages
-                Resource: [!GetAtt ChronosRepo.Arn, !GetAtt AgentRepo.Arn]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${RuntimeNamePrefix}-forecast"
+                  - !Sub "arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${RuntimeNamePrefix}-agent"
               - Effect: Allow
                 Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
                 Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}*"
@@ -311,7 +321,7 @@ Resources:
       Environment:
         Variables:
           PROJECT_NAME: !Ref BuildProject
-          REPOS: !Sub "${ChronosRepo},${AgentRepo}"
+          REPOS: !Sub "${RuntimeNamePrefix}-forecast,${RuntimeNamePrefix}-agent"
       Code:
         ZipFile: |
           import json, os, urllib.request, boto3
@@ -354,14 +364,14 @@ Resources:
                       try:
                           ecr.describe_images(repositoryName=repo, imageIds=[{"imageTag": props["ImageTag"]}])
                           return True
-                      except ecr.exceptions.ImageNotFoundException:
+                      except (ecr.exceptions.ImageNotFoundException, ecr.exceptions.RepositoryNotFoundException):
                           return False
-                  if all(exists(r) for r in os.environ["REPOS"].split(",")):
-                      print("images already exist for tag", props["ImageTag"], "- skipping build")
-                      respond(event, "SUCCESS", "images already present")
-                      return
+                  # images present (re-created stack, key rotation, rollback): short "config" run that only writes the
+                  # LLM key into AgentCore Identity and enables Transaction Search; otherwise a full build (~30 min)
+                  mode = "config" if all(exists(r) for r in os.environ["REPOS"].split(",")) else "build"
+                  print("images for tag", props["ImageTag"], "present" if mode == "config" else "missing", "-> mode", mode)
                   cb.start_build(projectName=os.environ["PROJECT_NAME"],
-                                 environmentVariablesOverride=env("build") + [
+                                 environmentVariablesOverride=env(mode) + [
                                      {"name": "IMAGE_TAG", "value": props["ImageTag"], "type": "PLAINTEXT"},
                                      {"name": "GIT_REF", "value": props["GitRef"], "type": "PLAINTEXT"}])
                   print("build started; CodeBuild will signal CloudFormation")
@@ -370,6 +380,7 @@ Resources:
 
   ImageBuild:
     Type: Custom::ImageBuild
+    DependsOn: BuildSecrets
     Properties:
       ServiceToken: !GetAtt BuildTriggerFunction.Arn
       ImageTag: !Ref ImageTag
@@ -377,6 +388,7 @@ Resources:
       GitRepoUrl: !Ref GitRepoUrl
       SourceS3Uri: !Ref SourceS3Uri
       ModelWeightsBaseUrl: !Ref ModelWeightsBaseUrl
+      LlmKeyFingerprint: !Ref LlmKeyFingerprint   # changes when the key is rotated -> Update -> config run
 
   # ------------------------------------------------------------------ runtime roles (least privilege)
   ChronosRuntimeRole:
@@ -398,7 +410,7 @@ Resources:
             Statement:
               - Effect: Allow
                 Action: [ecr:BatchGetImage, ecr:GetDownloadUrlForLayer]
-                Resource: !GetAtt ChronosRepo.Arn
+                Resource: !Sub "arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${RuntimeNamePrefix}-forecast"
               - Effect: Allow
                 Action: ecr:GetAuthorizationToken
                 Resource: "*"
@@ -437,7 +449,7 @@ Resources:
             Statement:
               - Effect: Allow
                 Action: [ecr:BatchGetImage, ecr:GetDownloadUrlForLayer]
-                Resource: !GetAtt AgentRepo.Arn
+                Resource: !Sub "arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${RuntimeNamePrefix}-agent"
               - Effect: Allow
                 Action: ecr:GetAuthorizationToken
                 Resource: "*"
@@ -495,7 +507,7 @@ Resources:
       Description: Chronos-2 sales forecasting MCP server (CPU)
       AgentRuntimeArtifact:
         ContainerConfiguration:
-          ContainerUri: !Sub "${ChronosRepo.RepositoryUri}:${ImageTag}"
+          ContainerUri: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.${AWS::URLSuffix}/${RuntimeNamePrefix}-forecast:${ImageTag}"
       RoleArn: !GetAtt ChronosRuntimeRole.Arn
       NetworkConfiguration: { NetworkMode: PUBLIC }
       ProtocolConfiguration: MCP
@@ -512,7 +524,7 @@ Resources:
       Description: Replenishment assistant agent (Strands + LLM + Chronos-2 + weather + Code Interpreter)
       AgentRuntimeArtifact:
         ContainerConfiguration:
-          ContainerUri: !Sub "${AgentRepo.RepositoryUri}:${ImageTag}"
+          ContainerUri: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.${AWS::URLSuffix}/${RuntimeNamePrefix}-agent:${ImageTag}"
       RoleArn: !GetAtt AgentRuntimeRole.Arn
       NetworkConfiguration: { NetworkMode: PUBLIC }
       ProtocolConfiguration: HTTP

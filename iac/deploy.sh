@@ -11,15 +11,31 @@ SRC="${1:?GitRepoUrl 或 s3://bucket/src.zip}"; DATA_FILE="${2:?parquet 文件�
 if [[ "${SRC}" == s3://* ]]; then REPO_URL=""; SRC_S3="${SRC}"; else REPO_URL="${SRC}"; SRC_S3=""; fi
 : "${LLM_API_KEY:?请通过环境变量 LLM_API_KEY 传入大模型 API Key}"
 export AWS_REGION="${AWS_REGION:-cn-northwest-1}" AWS_DEFAULT_REGION="${AWS_REGION:-cn-northwest-1}"
+LLM_BASE_URL="${LLM_BASE_URL:-https://api.ppinfra.com/v3/openai}"; LLM_MODEL="${LLM_MODEL:-deepseek/deepseek-v4-flash-0731}"
+# Key 指纹（sha256 前 12 位，不含 Key 本身）：变化时模板会跑一次短构建把新 Key 写进 AgentCore Identity
+LLM_KEY_FP=$(printf %s "${LLM_API_KEY}" | python3 -c 'import hashlib,sys;print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:12])')
 
-echo "==> [1/3] 部署 CloudFormation 栈 ${STACK}（含镜像构建，首次约 20~30 分钟）"
+# 部署前先用这把 Key 调一次大模型接口：模型名写错 / Key 无效 / 余额不足在这里就能发现，不用等 Agent 报 500
+if [[ "${SKIP_LLM_CHECK:-0}" != "1" ]]; then
+  echo "==> [0/3] 预检大模型接口 ${LLM_BASE_URL} 模型 ${LLM_MODEL}"
+  code=$(curl -sS -m 60 -o /tmp/llm_check.json -w '%{http_code}' "${LLM_BASE_URL%/}/chat/completions" \
+    -H "Authorization: Bearer ${LLM_API_KEY}" -H "Content-Type: application/json" \
+    -d "{\"model\":\"${LLM_MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":5}" || echo 000)
+  if [[ "${code}" != "200" ]]; then
+    echo "大模型接口预检失败（HTTP ${code}）："; cat /tmp/llm_check.json 2>/dev/null; echo
+    echo "请核对 LLM_BASE_URL / LLM_MODEL / LLM_API_KEY（接口返回的 message 通常会写明支持的模型名）。确认无误仍要继续可加 SKIP_LLM_CHECK=1"; exit 1
+  fi
+  echo "预检通过"
+fi
+
+echo "==> [1/3] 部署 CloudFormation 栈 ${STACK}（首次含镜像构建约 25~40 分钟；镜像已存在时约 3 分钟）"
 aws cloudformation deploy --stack-name "${STACK}" --template-file iac/template.yaml \
   --capabilities CAPABILITY_NAMED_IAM --no-fail-on-empty-changeset \
   --parameter-overrides \
     GitRepoUrl="${REPO_URL}" SourceS3Uri="${SRC_S3}" GitRef="${GIT_REF:-main}" GitHubToken="${GITHUB_TOKEN:-none}" \
     ModelWeightsBaseUrl="${WEIGHTS_URL:-https://www.modelscope.cn/models/amazon/chronos-2/resolve/master}" ImageTag="${IMAGE_TAG:-v1}" RuntimeNamePrefix="${PREFIX:-chronos2}" \
-    LlmApiKey="${LLM_API_KEY}" LlmBaseUrl="${LLM_BASE_URL:-https://api.ppinfra.com/v3/openai}" \
-    LlmModel="${LLM_MODEL:-deepseek/deepseek-v4-flash-0731}" StoreCity="${STORE_CITY:-西安}" \
+    LlmApiKey="${LLM_API_KEY}" LlmKeyFingerprint="${LLM_KEY_FP}" LlmBaseUrl="${LLM_BASE_URL}" \
+    LlmModel="${LLM_MODEL}" StoreCity="${STORE_CITY:-西安}" \
     IdleTimeoutSeconds="${IDLE_TIMEOUT:-600}"
 
 out() { aws cloudformation describe-stacks --stack-name "${STACK}" --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
@@ -49,6 +65,6 @@ Claude Code 直连预测服务：
   $(out McpProxyCommand)
 
 更新代码：改 IMAGE_TAG 重新运行本脚本，第 2 个参数传 -（只重建改动过的镜像，两个 Runtime 滚动到新版本）。
-换大模型：改 LLM_BASE_URL / LLM_MODEL 重跑（约 2 分钟）；换 API Key 还需同时改 IMAGE_TAG（约 8 分钟）。详见 docs/优化与运维指南.md
+换大模型 / 换 Key：改 LLM_BASE_URL / LLM_MODEL / LLM_API_KEY 重跑本脚本（第 2 个参数传 -），约 2~4 分钟，不重建镜像。详见 docs/优化与运维指南.md
 删除：aws cloudformation delete-stack --stack-name ${STACK}   （数据桶保留，需手动删除）
 EOF

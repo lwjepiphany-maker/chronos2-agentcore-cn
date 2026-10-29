@@ -32,7 +32,7 @@ AI 助手（Claude Code / Kiro）──mcp-proxy-for-aws──▶ Runtime②（�
 | `tools/export_from_db.py` | 数据库 → parquet → S3 的定时导出模板（生产数据管道） |
 | `tools/mock_master_data.py`、`iac/prepare_master.py` | 模拟 / 转换商品主数据与库存快照（保质期、到货周期、箱规、库存） |
 | `tests/` | 预测服务基准、Agent 对话测试、测试用例生成 |
-| `docs/` | 客户版部署方案、技术指南、部署前检查清单、销售数据格式说明、**优化与运维指南**（上线后流水线 / 调优 / 换大模型）、两阶段验证报告、`architecture/` 架构图（PNG + 交互式 HTML） |
+| `docs/` | 客户版部署方案、技术指南、部署前检查清单、销售数据格式说明、**优化与运维指南**（上线后流水线 / 调优 / 换大模型）、**排障指南**（现象 → 原因 → 处理）、两阶段验证报告、`architecture/` 架构图（PNG + 交互式 HTML） |
 
 ## 部署（首次 20～30 分钟）
 
@@ -77,7 +77,7 @@ $env:LLM_API_KEY = 'sk_xxx'
 
 离线部署：把仓库打成 zip 放到客户 S3，第 2 步第一个参数改为 `s3://<桶>/src.zip`。
 
-升级 / 回滚：改 `IMAGE_TAG` 重跑第 2 步；两个 Runtime 保留历史版本，CloudFormation 失败自动回滚。删除：`aws cloudformation delete-stack --stack-name chronos2-agentcore`（数据桶保留）。
+升级 / 回滚：改 `IMAGE_TAG` 重跑第 2 步（第 2 个参数传 `-` 不重传数据）；换大模型 / 换 Key：改 `LLM_*` 重跑第 2 步，约 3 分钟不重建镜像。两个 Runtime 保留历史版本，CloudFormation 失败自动回滚。删除：`aws cloudformation delete-stack --stack-name chronos2-agentcore`（数据桶与 ECR 镜像保留，重新部署秒级复用）。出问题先看 `docs/排障指南.md`。
 
 ## 使用
 

@@ -763,8 +763,15 @@ def _current_trace_id() -> str | None:
 def invoke(payload: dict, context=None) -> dict:
     prompt = payload.get("prompt", "")
     t0 = time.time()
-    agent = _get_agent()
-    result = agent(prompt)
+    try:
+        agent = _get_agent()
+        result = agent(prompt)
+    except Exception as e:  # noqa: BLE001
+        # 以 200 返回错误原文（模型名不被支持 / Key 无效 / 余额不足 / 数据未就位…），避免前端只看到一个 500
+        logger.exception("invoke failed")
+        return {"result": f"调用失败：{type(e).__name__}: {e}", "error": {"type": type(e).__name__, "message": str(e)},
+                "model": LLM_MODEL, "model_endpoint": urllib.parse.urlparse(LLM_BASE_URL).netloc,
+                "trace_id": _current_trace_id(), "total_ms": round((time.time() - t0) * 1000)}
     m = result.metrics
     tools_used = [{"tool": name, "calls": tm.call_count, "ms": round(tm.total_time * 1000)}
                   for name, tm in m.tool_metrics.items()]
