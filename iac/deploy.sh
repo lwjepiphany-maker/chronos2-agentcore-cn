@@ -36,7 +36,16 @@ aws cloudformation deploy --stack-name "${STACK}" --template-file iac/template.y
     ModelWeightsBaseUrl="${WEIGHTS_URL:-https://www.modelscope.cn/models/amazon/chronos-2/resolve/master}" ImageTag="${IMAGE_TAG:-v1}" RuntimeNamePrefix="${PREFIX:-chronos2}" \
     LlmApiKey="${LLM_API_KEY}" LlmKeyFingerprint="${LLM_KEY_FP}" LlmBaseUrl="${LLM_BASE_URL}" \
     LlmModel="${LLM_MODEL}" StoreCity="${STORE_CITY:-西安}" \
-    IdleTimeoutSeconds="${IDLE_TIMEOUT:-600}"
+    IdleTimeoutSeconds="${IDLE_TIMEOUT:-600}" || {
+  # 本机网络抖动会让 CLI 在等待阶段断开，但栈在云端继续；只要栈还在进行中就接着等，不要误判为部署失败
+  st=$(aws cloudformation describe-stacks --stack-name "${STACK}" --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo NONE)
+  case "${st}" in
+    CREATE_IN_PROGRESS) echo "CLI 连接中断，栈仍在创建中，继续等待…"; aws cloudformation wait stack-create-complete --stack-name "${STACK}" ;;
+    UPDATE_IN_PROGRESS|UPDATE_COMPLETE_CLEANUP_IN_PROGRESS) echo "CLI 连接中断，栈仍在更新中，继续等待…"; aws cloudformation wait stack-update-complete --stack-name "${STACK}" ;;
+    CREATE_COMPLETE|UPDATE_COMPLETE) echo "栈已完成（${st}）" ;;
+    *) echo "部署失败，栈状态：${st}。排查：aws cloudformation describe-stack-events --stack-name ${STACK}；对照 docs/排障指南.md"; exit 1 ;;
+  esac
+}
 
 out() { aws cloudformation describe-stacks --stack-name "${STACK}" --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
 BUCKET=$(out DataBucket)
