@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 一键部署：CloudFormation 建栈（含 CodeBuild 构建镜像）→ 上传销售数据 → 打印调用信息
-# 用法：LLM_API_KEY=sk_xxx bash iac/deploy.sh <GitRepoUrl 或 s3://bucket/src.zip> <sales_daily.parquet> [stack-name]
+# 用法：LLM_API_KEY=sk_xxx bash iac/deploy.sh <GitRepoUrl 或 s3://bucket/src.zip> <sales_daily.parquet 或 -> [stack-name]
+#       第 2 个参数传 "-" 表示不上传数据（换 Key / 换模型 / 升级代码时用，避免覆盖 S3 上更新的数据）
 # 可选环境变量：AWS_REGION(默认 cn-northwest-1) GIT_REF(main) WEIGHTS_URL IMAGE_TAG(v1) PREFIX(chronos2) STORE_CITY(西安)
 #               LLM_BASE_URL LLM_MODEL GITHUB_TOKEN(私有仓库)
 set -euo pipefail
@@ -24,8 +25,12 @@ aws cloudformation deploy --stack-name "${STACK}" --template-file iac/template.y
 out() { aws cloudformation describe-stacks --stack-name "${STACK}" --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
 BUCKET=$(out DataBucket)
 
-echo "==> [2/3] 上传销售数据到 s3://${BUCKET}/data/sales_daily.parquet"
-aws s3 cp "${DATA_FILE}" "s3://${BUCKET}/data/sales_daily.parquet" --only-show-errors
+if [[ "${DATA_FILE}" == "-" ]]; then
+  echo "==> [2/3] 跳过数据上传（保留 s3://${BUCKET}/data/sales_daily.parquet 现有数据）"
+else
+  echo "==> [2/3] 上传销售数据到 s3://${BUCKET}/data/sales_daily.parquet"
+  aws s3 cp "${DATA_FILE}" "s3://${BUCKET}/data/sales_daily.parquet" --only-show-errors
+fi
 
 echo "==> [3/3] 完成"
 cat <<EOF
@@ -43,6 +48,7 @@ Agent Runtime ARN    : $(out AgentRuntimeArn)
 Claude Code 直连预测服务：
   $(out McpProxyCommand)
 
-更新代码/模型：改 IMAGE_TAG 重新运行本脚本（CodeBuild 重建镜像，两个 Runtime 滚动到新版本）。
+更新代码：改 IMAGE_TAG 重新运行本脚本，第 2 个参数传 -（只重建改动过的镜像，两个 Runtime 滚动到新版本）。
+换大模型：改 LLM_BASE_URL / LLM_MODEL 重跑（约 2 分钟）；换 API Key 还需同时改 IMAGE_TAG（约 8 分钟）。详见 docs/优化与运维指南.md
 删除：aws cloudformation delete-stack --stack-name ${STACK}   （数据桶保留，需手动删除）
 EOF
