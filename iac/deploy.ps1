@@ -53,14 +53,24 @@ if ($env:SKIP_LLM_CHECK -ne "1") {
 
 if ($Source -like "s3://*") { $RepoUrl = ""; $SrcS3 = $Source } else { $RepoUrl = $Source; $SrcS3 = "" }
 
-Write-Host "==> [1/3] 部署 CloudFormation 栈 $StackName（含镜像构建，首次约 20~30 分钟）"
+$Params = @("GitRepoUrl=$RepoUrl", "SourceS3Uri=$SrcS3", "GitRef=$GitRef", "GitHubToken=$GitHubToken",
+  "ModelWeightsBaseUrl=$WeightsUrl", "ImageTag=$ImageTag", "RuntimeNamePrefix=$Prefix",
+  "LlmApiKey=$($env:LLM_API_KEY)", "LlmBaseUrl=$LlmBaseUrl", "LlmModel=$LlmModel", "StoreCity=$StoreCity", "IdleTimeoutSeconds=$IdleTimeout")
+
+# 旧版栈（ECR 仓库仍是栈资源）直接换新模板会连镜像一起删：检测到就先跑一次"保留 ECR"的中间模板
+$oldEcr = aws cloudformation describe-stack-resources --stack-name $StackName --region $Region `
+  --query "StackResources[?ResourceType=='AWS::ECR::Repository'].LogicalResourceId" --output text 2>$null
+if ($LASTEXITCODE -eq 0 -and $oldEcr -and $oldEcr.Trim() -ne "" -and $oldEcr.Trim() -ne "None") {
+  Write-Host "==> [1/3 前置] 检测到旧版栈，先标记 ECR 仓库为保留（约 1 分钟）"
+  aws cloudformation deploy --stack-name $StackName --template-file iac/migrate/step1-retain-ecr.yaml `
+    --capabilities CAPABILITY_NAMED_IAM --no-fail-on-empty-changeset --region $Region --parameter-overrides @Params
+  if ($LASTEXITCODE -ne 0) { throw "前置迁移失败" }
+}
+
+Write-Host "==> [1/3] 部署 CloudFormation 栈 $StackName（首次含镜像构建约 25~40 分钟；镜像已存在时约 3 分钟）"
 aws cloudformation deploy --stack-name $StackName --template-file iac/template.yaml `
   --capabilities CAPABILITY_NAMED_IAM --no-fail-on-empty-changeset --region $Region `
-  --parameter-overrides `
-    "GitRepoUrl=$RepoUrl" "SourceS3Uri=$SrcS3" "GitRef=$GitRef" "GitHubToken=$GitHubToken" `
-    "ModelWeightsBaseUrl=$WeightsUrl" "ImageTag=$ImageTag" "RuntimeNamePrefix=$Prefix" `
-    "LlmApiKey=$($env:LLM_API_KEY)" "LlmKeyFingerprint=$KeyFp" "LlmBaseUrl=$LlmBaseUrl" "LlmModel=$LlmModel" "StoreCity=$StoreCity" `
-    "IdleTimeoutSeconds=$IdleTimeout"
+  --parameter-overrides @Params "LlmKeyFingerprint=$KeyFp"
 if ($LASTEXITCODE -ne 0) { throw "CloudFormation 部署失败，请查看：aws cloudformation describe-stack-events --stack-name $StackName --region $Region" }
 
 function Get-Output([string] $Key) {
