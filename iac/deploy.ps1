@@ -13,7 +13,7 @@
 #>
 param(
   [Parameter(Mandatory = $true)] [string] $Source,      # GitHub 仓库地址，或 s3://bucket/src.zip
-  [Parameter(Mandatory = $true)] [string] $DataFile,    # prepare_data.py 生成的 parquet
+  [Parameter(Mandatory = $true)] [string] $DataFile,    # prepare_data.py 生成的 parquet；传 "-" 表示不上传数据
   [string] $StackName  = "chronos2-agentcore",
   [string] $Region     = $(if ($env:AWS_REGION) { $env:AWS_REGION } else { "cn-northwest-1" }),
   [string] $Prefix     = "chronos2",
@@ -30,8 +30,26 @@ $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..")
 
 if (-not $env:LLM_API_KEY) { throw "请先设置环境变量 LLM_API_KEY（大模型 API Key）：`$env:LLM_API_KEY = 'sk_xxx'" }
-if (-not (Test-Path $DataFile)) { throw "找不到数据文件 $DataFile，请先运行 python iac\prepare_data.py" }
+if ($DataFile -ne "-" -and -not (Test-Path $DataFile)) { throw "找不到数据文件 $DataFile，请先运行 python iac\prepare_data.py" }
 $env:AWS_DEFAULT_REGION = $Region
+# Key 指纹（sha256 前 12 位，不含 Key 本身）：变化时模板会跑一次短构建把新 Key 写进 AgentCore Identity
+$sha = [System.Security.Cryptography.SHA256]::Create()
+$KeyFp = (($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($env:LLM_API_KEY)) | ForEach-Object { $_.ToString("x2") }) -join "").Substring(0, 12)
+
+# 部署前先用这把 Key 调一次大模型接口，模型名 / Key / 余额问题在这里就能发现
+if ($env:SKIP_LLM_CHECK -ne "1") {
+  Write-Host "==> [0/3] 预检大模型接口 $LlmBaseUrl 模型 $LlmModel"
+  try {
+    $body = @{ model = $LlmModel; messages = @(@{ role = "user"; content = "hi" }); max_tokens = 5 } | ConvertTo-Json -Depth 5 -Compress
+    Invoke-RestMethod -Method Post -Uri ($LlmBaseUrl.TrimEnd("/") + "/chat/completions") -TimeoutSec 60 `
+      -Headers @{ Authorization = "Bearer $($env:LLM_API_KEY)" } -ContentType "application/json; charset=utf-8" `
+      -Body ([Text.Encoding]::UTF8.GetBytes($body)) | Out-Null
+    Write-Host "预检通过"
+  } catch {
+    $detail = $_.ErrorDetails.Message; if (-not $detail) { $detail = $_.Exception.Message }
+    throw "大模型接口预检失败：$detail`n请核对 -LlmBaseUrl / -LlmModel / LLM_API_KEY。确认无误仍要继续可设置 `$env:SKIP_LLM_CHECK = '1'"
+  }
+}
 
 if ($Source -like "s3://*") { $RepoUrl = ""; $SrcS3 = $Source } else { $RepoUrl = $Source; $SrcS3 = "" }
 
@@ -41,7 +59,7 @@ aws cloudformation deploy --stack-name $StackName --template-file iac/template.y
   --parameter-overrides `
     "GitRepoUrl=$RepoUrl" "SourceS3Uri=$SrcS3" "GitRef=$GitRef" "GitHubToken=$GitHubToken" `
     "ModelWeightsBaseUrl=$WeightsUrl" "ImageTag=$ImageTag" "RuntimeNamePrefix=$Prefix" `
-    "LlmApiKey=$($env:LLM_API_KEY)" "LlmBaseUrl=$LlmBaseUrl" "LlmModel=$LlmModel" "StoreCity=$StoreCity" `
+    "LlmApiKey=$($env:LLM_API_KEY)" "LlmKeyFingerprint=$KeyFp" "LlmBaseUrl=$LlmBaseUrl" "LlmModel=$LlmModel" "StoreCity=$StoreCity" `
     "IdleTimeoutSeconds=$IdleTimeout"
 if ($LASTEXITCODE -ne 0) { throw "CloudFormation 部署失败，请查看：aws cloudformation describe-stack-events --stack-name $StackName --region $Region" }
 
@@ -51,9 +69,13 @@ function Get-Output([string] $Key) {
 }
 $Bucket = Get-Output "DataBucket"
 
-Write-Host "==> [2/3] 上传销售数据到 s3://$Bucket/data/sales_daily.parquet"
-aws s3 cp $DataFile "s3://$Bucket/data/sales_daily.parquet" --region $Region --only-show-errors
-if ($LASTEXITCODE -ne 0) { throw "数据上传失败" }
+if ($DataFile -eq "-") {
+  Write-Host "==> [2/3] 跳过数据上传（保留 S3 上现有数据）"
+} else {
+  Write-Host "==> [2/3] 上传销售数据到 s3://$Bucket/data/sales_daily.parquet"
+  aws s3 cp $DataFile "s3://$Bucket/data/sales_daily.parquet" --region $Region --only-show-errors
+  if ($LASTEXITCODE -ne 0) { throw "数据上传失败" }
+}
 
 $ChronosArn = Get-Output "ChronosRuntimeArn"
 $AgentArn   = Get-Output "AgentRuntimeArn"
@@ -75,4 +97,4 @@ Write-Host "  streamlit run frontend\app.py -- --agent-arn $AgentArn --data-buck
 Write-Host "Claude Code 直连预测服务："
 Write-Host "  $McpCmd"
 Write-Host ""
-Write-Host "更新代码/模型：改 -ImageTag 重新运行本脚本。删除：aws cloudformation delete-stack --stack-name $StackName --region $Region（数据桶保留）"
+Write-Host "更新代码：改 -ImageTag 重新运行本脚本（-DataFile -）。换大模型/换 Key：改参数重跑即可。删除：aws cloudformation delete-stack --stack-name $StackName --region $Region（数据桶与 ECR 镜像保留）"

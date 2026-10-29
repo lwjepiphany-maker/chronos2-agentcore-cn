@@ -239,6 +239,8 @@ if busy:
         try:
             body = fut.result()
             text = body.get("result", "")
+            if body.get("error"):
+                text = f"❌ **Agent 调用失败**（{body['error'].get('type')}）\n\n```\n{body['error'].get('message')}\n```\n\n常见原因：模型名不被接口支持、API Key 无效或余额不足、销售数据未上传。"
             if body.get("model"):
                 st.session_state.model_info = {"model": body["model"], "endpoint": body.get("model_endpoint", "")}
             imgs, files = fetch_files(text)
