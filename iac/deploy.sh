@@ -28,15 +28,22 @@ if [[ "${SKIP_LLM_CHECK:-0}" != "1" ]]; then
   echo "预检通过"
 fi
 
+PARAMS=(GitRepoUrl="${REPO_URL}" SourceS3Uri="${SRC_S3}" GitRef="${GIT_REF:-main}" GitHubToken="${GITHUB_TOKEN:-none}"
+  ModelWeightsBaseUrl="${WEIGHTS_URL:-https://www.modelscope.cn/models/amazon/chronos-2/resolve/master}" ImageTag="${IMAGE_TAG:-v1}" RuntimeNamePrefix="${PREFIX:-chronos2}"
+  LlmApiKey="${LLM_API_KEY}" LlmBaseUrl="${LLM_BASE_URL}" LlmModel="${LLM_MODEL}" StoreCity="${STORE_CITY:-西安}" IdleTimeoutSeconds="${IDLE_TIMEOUT:-600}")
+
+# 2026-10-28 之前的模板把 ECR 仓库放在栈里；直接换成新模板会连镜像一起删。检测到旧栈时自动先跑一次"保留 ECR"的中间模板
+if aws cloudformation describe-stack-resources --stack-name "${STACK}" \
+     --query "StackResources[?ResourceType=='AWS::ECR::Repository'].LogicalResourceId" --output text 2>/dev/null | grep -q .; then
+  echo "==> [1/3 前置] 检测到旧版栈（ECR 仓库仍是栈资源），先标记为保留（约 1 分钟），镜像不会被删"
+  aws cloudformation deploy --stack-name "${STACK}" --template-file iac/migrate/step1-retain-ecr.yaml \
+    --capabilities CAPABILITY_NAMED_IAM --no-fail-on-empty-changeset --parameter-overrides "${PARAMS[@]}"
+fi
+
 echo "==> [1/3] 部署 CloudFormation 栈 ${STACK}（首次含镜像构建约 25~40 分钟；镜像已存在时约 3 分钟）"
 aws cloudformation deploy --stack-name "${STACK}" --template-file iac/template.yaml \
   --capabilities CAPABILITY_NAMED_IAM --no-fail-on-empty-changeset \
-  --parameter-overrides \
-    GitRepoUrl="${REPO_URL}" SourceS3Uri="${SRC_S3}" GitRef="${GIT_REF:-main}" GitHubToken="${GITHUB_TOKEN:-none}" \
-    ModelWeightsBaseUrl="${WEIGHTS_URL:-https://www.modelscope.cn/models/amazon/chronos-2/resolve/master}" ImageTag="${IMAGE_TAG:-v1}" RuntimeNamePrefix="${PREFIX:-chronos2}" \
-    LlmApiKey="${LLM_API_KEY}" LlmKeyFingerprint="${LLM_KEY_FP}" LlmBaseUrl="${LLM_BASE_URL}" \
-    LlmModel="${LLM_MODEL}" StoreCity="${STORE_CITY:-西安}" \
-    IdleTimeoutSeconds="${IDLE_TIMEOUT:-600}" || {
+  --parameter-overrides "${PARAMS[@]}" LlmKeyFingerprint="${LLM_KEY_FP}" || {
   # 本机网络抖动会让 CLI 在等待阶段断开，但栈在云端继续；只要栈还在进行中就接着等，不要误判为部署失败
   st=$(aws cloudformation describe-stacks --stack-name "${STACK}" --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo NONE)
   case "${st}" in
