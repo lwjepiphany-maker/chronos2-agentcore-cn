@@ -1,0 +1,560 @@
+AWSTemplateFormatVersion: "2010-09-09"
+# 迁移用中间模板（= 2026-10-28 版模板 + ECR 仓库 Retain）。只在把 10-28 之前部署的栈升级到当前模板时用一次：
+#   先用本文件 deploy 一次（让 CloudFormation 记住"删除时保留 ECR 仓库"），再用 iac/template.yaml deploy。
+# 直接用新模板更新旧栈会把 ECR 仓库连同镜像一起删掉。详见 docs/排障指南.md"升级旧栈"。
+Description: >-
+  Chronos-2 sales forecasting on Amazon Bedrock AgentCore (China regions).
+  One stack builds both container images from a GitHub repo via CodeBuild, then creates
+  the Chronos-2 MCP Runtime, the replenishment Agent Runtime, the data bucket, IAM roles,
+  the LLM API-key credential provider (AgentCore Identity) and enables CloudWatch Transaction Search.
+
+Parameters:
+  GitRepoUrl:
+    Type: String
+    Default: ""
+    Description: HTTPS URL of the Git repo containing app/, app_agent/ (e.g. https://github.com/<user>/chronos2-agentcore-cn.git). Leave empty when using SourceS3Uri.
+  SourceS3Uri:
+    Type: String
+    Default: ""
+    Description: Alternative to GitRepoUrl - s3://bucket/key.zip holding the repo contents (zip of the repo root). Used when the customer receives the package offline.
+  GitRef:
+    Type: String
+    Default: main
+    Description: Branch, tag or commit to build
+  GitHubToken:
+    Type: String
+    Default: none
+    NoEcho: true
+    Description: Personal access token for a private repo; leave "none" for public repos
+  ModelWeightsBaseUrl:
+    Type: String
+    Default: https://www.modelscope.cn/models/amazon/chronos-2/resolve/master
+    Description: >-
+      Base URL holding model.safetensors / config.json / configuration.json. Default is the ModelScope
+      mirror of amazon/chronos-2 (fast inside China); a GitHub Release works too
+      (https://github.com/<user>/<repo>/releases/download/weights-v1).
+  ImageTag:
+    Type: String
+    Default: v1
+    Description: Image tag; change it to rebuild and roll both runtimes to a new version
+  RuntimeNamePrefix:
+    Type: String
+    Default: chronos2
+    AllowedPattern: "^[a-z][a-z0-9]{0,15}$"
+    Description: Prefix for runtime names (<prefix>_forecast, <prefix>_agent) and the data bucket
+  LlmApiKey:
+    Type: String
+    NoEcho: true
+    Description: API key of the OpenAI-compatible LLM endpoint (stored in AgentCore Identity)
+  LlmBaseUrl:
+    Type: String
+    Default: https://api.ppinfra.com/v3/openai
+  LlmModel:
+    Type: String
+    Default: deepseek/deepseek-v4-flash-0731
+  StoreCity:
+    Type: String
+    Default: "西安"
+    Description: City of the stores, used by the Open-Meteo weather MCP
+  IdleTimeoutSeconds:
+    Type: Number
+    Default: 600
+    MinValue: 60
+    MaxValue: 28800
+    Description: Idle time before a session's microVM is released (billing stops)
+
+Resources:
+  # ------------------------------------------------------------------ storage
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${RuntimeNamePrefix}-agent-data-${AWS::AccountId}"
+      VersioningConfiguration: { Status: Enabled }   # 上传错数据可回退到上一版
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Project
+          Value: !Ref AWS::StackName
+
+  ChronosRepo:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Sub "${RuntimeNamePrefix}-forecast"
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: true
+  AgentRepo:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Sub "${RuntimeNamePrefix}-agent"
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: true
+
+  # The LLM key and git token are handed to CodeBuild as SECRETS_MANAGER env vars so they never
+  # appear in the CodeBuild console or logs. CodeBuild copies the key into AgentCore Identity.
+  BuildSecrets:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}/build-secrets"
+      SecretString: !Sub '{"llm_api_key":"${LlmApiKey}","github_token":"${GitHubToken}"}'
+
+  # ------------------------------------------------------------------ image build (CodeBuild, native arm64)
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: build
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${AWS::StackName}*"
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action: [ecr:BatchCheckLayerAvailability, ecr:CompleteLayerUpload, ecr:InitiateLayerUpload, ecr:PutImage, ecr:UploadLayerPart, ecr:BatchGetImage, ecr:GetDownloadUrlForLayer, ecr:DescribeImages]
+                Resource: [!GetAtt ChronosRepo.Arn, !GetAtt AgentRepo.Arn]
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref BuildSecrets
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::*/*"
+                Condition: { StringEquals: { "aws:ResourceAccount": !Ref AWS::AccountId } }
+              # AgentCore Identity API-key provider (stores the key in a Secrets Manager secret it manages)
+              - Effect: Allow
+                Action: [bedrock-agentcore:CreateApiKeyCredentialProvider, bedrock-agentcore:UpdateApiKeyCredentialProvider, bedrock-agentcore:GetApiKeyCredentialProvider, bedrock-agentcore:DeleteApiKeyCredentialProvider, bedrock-agentcore:CreateTokenVault, bedrock-agentcore:GetTokenVault]
+                Resource: "*"
+              - Effect: Allow
+                Action: [secretsmanager:CreateSecret, secretsmanager:PutSecretValue, secretsmanager:UpdateSecret, secretsmanager:DeleteSecret, secretsmanager:TagResource, secretsmanager:DescribeSecret]
+                Resource: !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:bedrock-agentcore-identity!*"
+              # CloudWatch Transaction Search (account-level, idempotent)
+              - Effect: Allow
+                Action: [xray:GetTraceSegmentDestination, xray:UpdateTraceSegmentDestination, xray:GetIndexingRules, xray:UpdateIndexingRule, logs:PutResourcePolicy, logs:DescribeResourcePolicies]
+                Resource: "*"
+              # UpdateTraceSegmentDestination creates these two log groups on first enablement
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:DescribeLogGroups]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans:*"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/application-signals/data"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/application-signals/data:*"
+
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${AWS::StackName}-image-build"
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      TimeoutInMinutes: 50
+      Artifacts: { Type: NO_ARTIFACTS }
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          env:
+            shell: bash
+          phases:
+            build:
+              commands:
+                - |
+                  set -euo pipefail
+                  signal() {  # 把结果回传给 CloudFormation 自定义资源（由 Lambda 透传的 ResponseURL）
+                    [ -n "${CFN_RESPONSE_URL:-}" ] || return 0
+                    curl -s -X PUT -H 'Content-Type:' --data-binary "{\"Status\":\"$1\",\"Reason\":\"$2\",\"PhysicalResourceId\":\"image-build\",\"StackId\":\"$CFN_STACK_ID\",\"RequestId\":\"$CFN_REQUEST_ID\",\"LogicalResourceId\":\"$CFN_LOGICAL_ID\",\"Data\":{\"ImageTag\":\"$IMAGE_TAG\"}}" "$CFN_RESPONSE_URL"
+                  }
+                  trap 'signal FAILED "build failed, see CodeBuild $CODEBUILD_BUILD_ID"' ERR
+                  export AWS_DEFAULT_REGION="$AWS_REGION"
+                  LLM_API_KEY=$(echo "$BUILD_SECRETS" | python3 -c 'import json,sys;print(json.load(sys.stdin)["llm_api_key"])')
+                  GITHUB_TOKEN=$(echo "$BUILD_SECRETS" | python3 -c 'import json,sys;print(json.load(sys.stdin)["github_token"])')
+
+                  if [ "$MODE" = "delete" ]; then
+                    aws bedrock-agentcore-control delete-api-key-credential-provider --name "$PROVIDER_NAME" || true
+                    exit 0
+                  fi
+
+                  if [ -n "$SOURCE_S3_URI" ]; then
+                    echo "==> fetch source zip $SOURCE_S3_URI"
+                    aws s3 cp "$SOURCE_S3_URI" /tmp/src.zip --only-show-errors
+                    mkdir -p src && unzip -q /tmp/src.zip -d src
+                    # zip 可能带一层顶级目录
+                    [ -f src/app/Dockerfile ] || { d=$(find src -mindepth 1 -maxdepth 1 -type d | head -1); mv "$d"/* "$d"/.[!.]* src/ 2>/dev/null || true; }
+                    cd src
+                  else
+                    echo "==> clone $REPO_URL@$GIT_REF"
+                    CLONE_URL="$REPO_URL"
+                    [ "$GITHUB_TOKEN" != "none" ] && CLONE_URL=$(echo "$REPO_URL" | sed "s#https://#https://${GITHUB_TOKEN}@#")
+                    git clone --depth 1 --branch "$GIT_REF" "$CLONE_URL" src \
+                      || { echo "ERROR: git clone failed. CodeBuild may not reach the Git host from this region; zip the repo to S3 and deploy with SourceS3Uri (deploy.sh first argument s3://bucket/src.zip)."; false; }
+                    cd src
+                  fi
+
+                  echo "==> model weights"
+                  mkdir -p model
+                  [ -n "$WEIGHTS_URL" ] || WEIGHTS_URL="https://www.modelscope.cn/models/amazon/chronos-2/resolve/master"
+                  echo "weights from $WEIGHTS_URL"
+                  for f in model.safetensors config.json configuration.json; do
+                    curl -fsSL --retry 3 --retry-delay 5 -o "model/$f" "$WEIGHTS_URL/$f"
+                  done
+                  ls -la model
+                  # 权重文件应为 ~478MB；小于 400MB 说明下载到了错误页面
+                  [ "$(stat -c %s model/model.safetensors)" -gt 400000000 ] || { echo "model.safetensors too small, download failed"; false; }
+
+                  echo "==> build & push images (native arm64)"
+                  aws ecr get-login-password | docker login --username AWS --password-stdin "${CHRONOS_REPO_URI%%/*}"
+                  tag_exists() { aws ecr describe-images --repository-name "$1" --image-ids imageTag="$2" >/dev/null 2>&1; }
+                  # 源码内容哈希：内容没变就把已有镜像重新打上新 tag（秒级），不重复下载 torch / 构建
+                  content_hash() { { find "$@" -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum; echo "$WEIGHTS_URL"; } | sha256sum | cut -c1-16; }
+                  build_or_reuse() {   # $1 repo uri  $2 hash tag  $3 dockerfile
+                    local repo="${1##*/}"
+                    echo "$repo content hash tag: $2"
+                    if tag_exists "$repo" "$IMAGE_TAG"; then echo "$repo:$IMAGE_TAG already exists, skipping"; return; fi
+                    if tag_exists "$repo" "$2"; then
+                      echo "$repo: source unchanged ($2), re-tagging existing image as $IMAGE_TAG"
+                      local manifest; manifest=$(aws ecr batch-get-image --repository-name "$repo" --image-ids imageTag="$2" --query 'images[0].imageManifest' --output text)
+                      aws ecr put-image --repository-name "$repo" --image-tag "$IMAGE_TAG" --image-manifest "$manifest" >/dev/null; return
+                    fi
+                    docker build -f "$3" -t "$1:$IMAGE_TAG" -t "$1:$2" . && docker push "$1:$IMAGE_TAG" && docker push "$1:$2"
+                  }
+                  build_or_reuse "$CHRONOS_REPO_URI" "src-$(content_hash app)" app/Dockerfile
+                  build_or_reuse "$AGENT_REPO_URI" "src-$(content_hash app_agent)" app_agent/Dockerfile
+
+                  echo "==> LLM API key -> AgentCore Identity provider $PROVIDER_NAME"
+                  if aws bedrock-agentcore-control get-api-key-credential-provider --name "$PROVIDER_NAME" >/dev/null 2>&1; then
+                    aws bedrock-agentcore-control update-api-key-credential-provider --name "$PROVIDER_NAME" --api-key "$LLM_API_KEY" >/dev/null
+                  else
+                    aws bedrock-agentcore-control create-api-key-credential-provider --name "$PROVIDER_NAME" --api-key "$LLM_API_KEY" >/dev/null
+                  fi
+
+                  echo "==> CloudWatch Transaction Search (for AgentCore Observability traces; best effort, account-level)"
+                  LG="arn:${PARTITION}:logs:${AWS_REGION}:${ACCOUNT_ID}:log-group"
+                  printf '{"Version":"2012-10-17","Statement":[{"Sid":"TransactionSearchXRayAccess","Effect":"Allow","Principal":{"Service":"xray.amazonaws.com"},"Action":"logs:PutLogEvents","Resource":["%s:aws/spans:*","%s:/aws/application-signals/data:*"],"Condition":{"ArnLike":{"aws:SourceArn":"arn:%s:xray:%s:%s:*"},"StringEquals":{"aws:SourceAccount":"%s"}}}]}' \
+                    "$LG" "$LG" "$PARTITION" "$AWS_REGION" "$ACCOUNT_ID" "$ACCOUNT_ID" > /tmp/xray-policy.json
+                  if aws logs put-resource-policy --policy-name TransactionSearchXRayAccess --policy-document file:///tmp/xray-policy.json >/dev/null \
+                     && { [ "$(aws xray get-trace-segment-destination --query Destination --output text)" = "CloudWatchLogs" ] || aws xray update-trace-segment-destination --destination CloudWatchLogs >/dev/null; }; then
+                    aws xray update-indexing-rule --name Default --rule '{"Probabilistic":{"DesiredSamplingPercentage":100}}' >/dev/null || true
+                    echo "Transaction Search enabled"
+                  else
+                    echo "WARNING: could not enable CloudWatch Transaction Search (account policy / permission). Deployment continues; traces will not be visible until an admin runs: aws xray update-trace-segment-destination --destination CloudWatchLogs"
+                  fi
+
+                  signal SUCCESS "images pushed with tag $IMAGE_TAG"
+      Environment:
+        Type: ARM_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/amazonlinux2-aarch64-standard:3.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - { Name: MODE, Value: build }
+          - { Name: REPO_URL, Value: !Ref GitRepoUrl }
+          - { Name: SOURCE_S3_URI, Value: !Ref SourceS3Uri }
+          - { Name: GIT_REF, Value: !Ref GitRef }
+          - { Name: WEIGHTS_URL, Value: !Ref ModelWeightsBaseUrl }
+          - { Name: IMAGE_TAG, Value: !Ref ImageTag }
+          - { Name: CHRONOS_REPO_URI, Value: !GetAtt ChronosRepo.RepositoryUri }
+          - { Name: AGENT_REPO_URI, Value: !GetAtt AgentRepo.RepositoryUri }
+          - { Name: PROVIDER_NAME, Value: !Sub "${RuntimeNamePrefix}-llm-key" }
+          - { Name: PARTITION, Value: !Ref AWS::Partition }
+          - { Name: ACCOUNT_ID, Value: !Ref AWS::AccountId }
+          - { Name: BUILD_SECRETS, Type: SECRETS_MANAGER, Value: !Ref BuildSecrets }
+      LogsConfig:
+        CloudWatchLogs: { Status: ENABLED }
+
+  # Lambda only *starts* the build and hands it the CloudFormation callback; CodeBuild signals completion.
+  BuildTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: start-build
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [codebuild:StartBuild, codebuild:BatchGetBuilds]
+                Resource: !GetAtt BuildProject.Arn
+              - Effect: Allow
+                Action: ecr:DescribeImages
+                Resource: [!GetAtt ChronosRepo.Arn, !GetAtt AgentRepo.Arn]
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}*"
+
+  BuildTriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-build-trigger"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 240
+      Role: !GetAtt BuildTriggerRole.Arn
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref BuildProject
+          REPOS: !Sub "${ChronosRepo},${AgentRepo}"
+      Code:
+        ZipFile: |
+          import json, os, urllib.request, boto3
+
+          def respond(event, status, reason="ok"):
+              body = json.dumps({"Status": status, "Reason": reason, "PhysicalResourceId": "image-build",
+                                 "StackId": event["StackId"], "RequestId": event["RequestId"],
+                                 "LogicalResourceId": event["LogicalResourceId"], "Data": {}}).encode()
+              req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT", headers={"Content-Type": ""})
+              urllib.request.urlopen(req)
+
+          def handler(event, context):
+              cb = boto3.client("codebuild")
+              env = lambda mode: [
+                  {"name": "MODE", "value": mode, "type": "PLAINTEXT"},
+                  {"name": "CFN_RESPONSE_URL", "value": event["ResponseURL"], "type": "PLAINTEXT"},
+                  {"name": "CFN_STACK_ID", "value": event["StackId"], "type": "PLAINTEXT"},
+                  {"name": "CFN_REQUEST_ID", "value": event["RequestId"], "type": "PLAINTEXT"},
+                  {"name": "CFN_LOGICAL_ID", "value": event["LogicalResourceId"], "type": "PLAINTEXT"},
+              ]
+              try:
+                  if event["RequestType"] == "Delete":
+                      # remove the Identity provider via a short CodeBuild run; wait for it so CloudFormation
+                      # does not delete the CodeBuild project underneath it. Best effort: never block stack deletion.
+                      try:
+                          import time
+                          bid = cb.start_build(projectName=os.environ["PROJECT_NAME"],
+                                               environmentVariablesOverride=[e for e in env("delete") if e["name"] == "MODE"])["build"]["id"]
+                          for _ in range(50):
+                              time.sleep(3)
+                              if cb.batch_get_builds(ids=[bid])["builds"][0]["buildStatus"] != "IN_PROGRESS":
+                                  break
+                      except Exception as e:
+                          print("delete build problem (ignored):", e)
+                      respond(event, "SUCCESS")
+                      return
+                  props = event["ResourceProperties"]
+                  ecr = boto3.client("ecr")
+                  def exists(repo):
+                      try:
+                          ecr.describe_images(repositoryName=repo, imageIds=[{"imageTag": props["ImageTag"]}])
+                          return True
+                      except ecr.exceptions.ImageNotFoundException:
+                          return False
+                  if all(exists(r) for r in os.environ["REPOS"].split(",")):
+                      print("images already exist for tag", props["ImageTag"], "- skipping build")
+                      respond(event, "SUCCESS", "images already present")
+                      return
+                  cb.start_build(projectName=os.environ["PROJECT_NAME"],
+                                 environmentVariablesOverride=env("build") + [
+                                     {"name": "IMAGE_TAG", "value": props["ImageTag"], "type": "PLAINTEXT"},
+                                     {"name": "GIT_REF", "value": props["GitRef"], "type": "PLAINTEXT"}])
+                  print("build started; CodeBuild will signal CloudFormation")
+              except Exception as e:
+                  respond(event, "FAILED", str(e))
+
+  ImageBuild:
+    Type: Custom::ImageBuild
+    Properties:
+      ServiceToken: !GetAtt BuildTriggerFunction.Arn
+      ImageTag: !Ref ImageTag
+      GitRef: !Ref GitRef
+      GitRepoUrl: !Ref GitRepoUrl
+      SourceS3Uri: !Ref SourceS3Uri
+      ModelWeightsBaseUrl: !Ref ModelWeightsBaseUrl
+
+  # ------------------------------------------------------------------ runtime roles (least privilege)
+  ChronosRuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: bedrock-agentcore.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+              ArnLike: { "aws:SourceArn": !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:*" }
+      Policies:
+        - PolicyName: runtime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [ecr:BatchGetImage, ecr:GetDownloadUrlForLayer]
+                Resource: !GetAtt ChronosRepo.Arn
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogStreams, logs:DescribeLogGroups]
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*"
+              - Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords, xray:GetSamplingRules, xray:GetSamplingTargets, xray:PutSpans, xray:PutSpansForIndexing]
+                Resource: "*"
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition: { StringEquals: { "cloudwatch:namespace": bedrock-agentcore } }
+              - Effect: Allow
+                Action: [bedrock-agentcore:GetWorkloadAccessToken, bedrock-agentcore:GetWorkloadAccessTokenForJWT, bedrock-agentcore:GetWorkloadAccessTokenForUserId]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default"
+                  - !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/${RuntimeNamePrefix}_forecast-*"
+
+  AgentRuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: bedrock-agentcore.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+              ArnLike: { "aws:SourceArn": !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:*" }
+      Policies:
+        - PolicyName: runtime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [ecr:BatchGetImage, ecr:GetDownloadUrlForLayer]
+                Resource: !GetAtt AgentRepo.Arn
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogStreams, logs:DescribeLogGroups]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/*"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans:*"
+              - Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords, xray:GetSamplingRules, xray:GetSamplingTargets, xray:PutSpans, xray:PutSpansForIndexing]
+                Resource: "*"
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition: { StringEquals: { "cloudwatch:namespace": bedrock-agentcore } }
+              - Effect: Allow
+                Action: [bedrock-agentcore:GetWorkloadAccessToken, bedrock-agentcore:GetWorkloadAccessTokenForJWT, bedrock-agentcore:GetWorkloadAccessTokenForUserId]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default"
+                  - !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/${RuntimeNamePrefix}_agent-*"
+              # LLM API key from AgentCore Identity: resource is the workload identity + directory, plus the managed secret
+              - Effect: Allow
+                Action: bedrock-agentcore:GetResourceApiKey
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:token-vault/default"
+                  - !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:token-vault/default/apikeycredentialprovider/${RuntimeNamePrefix}-llm-key"
+                  - !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default"
+                  - !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/${RuntimeNamePrefix}_agent-*"
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:bedrock-agentcore-identity!default/apikey/${RuntimeNamePrefix}-llm-key-*"
+              - Effect: Allow
+                Action: bedrock-agentcore:InvokeAgentRuntime
+                Resource:
+                  - !GetAtt ChronosRuntime.AgentRuntimeArn
+                  - !Sub "${ChronosRuntime.AgentRuntimeArn}/*"
+              - Effect: Allow
+                Action: [bedrock-agentcore:StartCodeInterpreterSession, bedrock-agentcore:InvokeCodeInterpreter, bedrock-agentcore:StopCodeInterpreterSession, bedrock-agentcore:GetCodeInterpreterSession, bedrock-agentcore:ListCodeInterpreterSessions, bedrock-agentcore:GetCodeInterpreter]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:aws:code-interpreter/aws.codeinterpreter.v1"
+                  - !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:aws:code-interpreter/aws.codeinterpreter.v1/*"
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: [!Sub "${DataBucket.Arn}/data/*", !Sub "${DataBucket.Arn}/master/*"]
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: [!Sub "${DataBucket.Arn}/charts/*", !Sub "${DataBucket.Arn}/reports/*"]
+
+  # ------------------------------------------------------------------ AgentCore Runtimes
+  ChronosRuntime:
+    Type: AWS::BedrockAgentCore::Runtime
+    DependsOn: ImageBuild
+    Properties:
+      AgentRuntimeName: !Sub "${RuntimeNamePrefix}_forecast"
+      Description: Chronos-2 sales forecasting MCP server (CPU)
+      AgentRuntimeArtifact:
+        ContainerConfiguration:
+          ContainerUri: !Sub "${ChronosRepo.RepositoryUri}:${ImageTag}"
+      RoleArn: !GetAtt ChronosRuntimeRole.Arn
+      NetworkConfiguration: { NetworkMode: PUBLIC }
+      ProtocolConfiguration: MCP
+      LifecycleConfiguration:
+        IdleRuntimeSessionTimeout: !Ref IdleTimeoutSeconds
+        MaxLifetime: 28800
+      Tags: { Project: !Ref AWS::StackName }
+
+  AgentRuntime:
+    Type: AWS::BedrockAgentCore::Runtime
+    DependsOn: ImageBuild
+    Properties:
+      AgentRuntimeName: !Sub "${RuntimeNamePrefix}_agent"
+      Description: Replenishment assistant agent (Strands + LLM + Chronos-2 + weather + Code Interpreter)
+      AgentRuntimeArtifact:
+        ContainerConfiguration:
+          ContainerUri: !Sub "${AgentRepo.RepositoryUri}:${ImageTag}"
+      RoleArn: !GetAtt AgentRuntimeRole.Arn
+      NetworkConfiguration: { NetworkMode: PUBLIC }
+      ProtocolConfiguration: HTTP
+      LifecycleConfiguration:
+        IdleRuntimeSessionTimeout: !Ref IdleTimeoutSeconds
+        MaxLifetime: 28800
+      EnvironmentVariables:
+        AWS_REGION: !Ref AWS::Region
+        CHRONOS_RUNTIME_ARN: !GetAtt ChronosRuntime.AgentRuntimeArn
+        DATA_URI: !Sub "s3://${DataBucket}/data/sales_daily.parquet"
+        CHART_BUCKET: !Ref DataBucket
+        CHART_PREFIX: charts/
+        REPORT_PREFIX: reports/
+        MASTER_PREFIX: master/
+        API_KEY_PROVIDER: !Sub "${RuntimeNamePrefix}-llm-key"
+        LLM_BASE_URL: !Ref LlmBaseUrl
+        LLM_MODEL: !Ref LlmModel
+        DEFAULT_CITY: !Ref StoreCity
+        OTEL_RESOURCE_ATTRIBUTES: !Sub "service.name=${RuntimeNamePrefix}_agent"
+        AGENT_OBSERVABILITY_ENABLED: "true"
+      Tags: { Project: !Ref AWS::StackName }
+
+Outputs:
+  ChronosRuntimeArn:
+    Value: !GetAtt ChronosRuntime.AgentRuntimeArn
+  AgentRuntimeArn:
+    Value: !GetAtt AgentRuntime.AgentRuntimeArn
+  DataBucket:
+    Value: !Ref DataBucket
+    Description: Upload sales history to s3://<bucket>/data/sales_daily.parquet; charts under charts/, batch reports under reports/
+  BuildProject:
+    Value: !Ref BuildProject
+    Description: CodeBuild project (logs under /aws/codebuild/<name>)
+  McpProxyCommand:
+    Description: Register the forecast MCP server in Claude Code (needs AWS credentials with InvokeAgentRuntime)
+    Value: !Sub
+      - "claude mcp add --scope user chronos2-forecast -- uvx mcp-proxy-for-aws@latest 'https://bedrock-agentcore.${AWS::Region}.amazonaws.com.cn/runtimes/${EncodedArn}/invocations?qualifier=DEFAULT' --service bedrock-agentcore --region ${AWS::Region}"
+      - EncodedArn: !Join ["%3A", !Split [":", !Join ["%2F", !Split ["/", !GetAtt ChronosRuntime.AgentRuntimeArn]]]]
