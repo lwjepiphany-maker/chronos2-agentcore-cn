@@ -1,7 +1,7 @@
 """MCP 端到端测试：调用 3 个工具，记录延迟、精度（对比留出的真实值），并可与 SageMaker GPU 端点对比数值。
 
 本地:     python tests/bench.py --url http://localhost:8000/mcp
-Runtime:  python tests/bench.py --runtime-arn arn:aws-cn:bedrock-agentcore:... [--sagemaker chronos2-abc-shop]
+Runtime:  python tests/bench.py --runtime-arn arn:aws-cn:bedrock-agentcore:... [--sagemaker <SAGEMAKER_ENDPOINT_NAME>]
 """
 import argparse
 import asyncio

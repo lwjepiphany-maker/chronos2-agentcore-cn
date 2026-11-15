@@ -9,7 +9,9 @@ from pathlib import Path
 
 import pandas as pd
 
-XLSX = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parents[2] / "abc shop测试门店商品数据0527.xlsx"
+if len(sys.argv) != 2:
+    raise SystemExit("用法：python tests/make_payloads.py <门店销售数据.xlsx>")
+XLSX = Path(sys.argv[1])
 OUT = Path(__file__).parent / "payloads"
 OUT.mkdir(exist_ok=True)
 H = 7  # 预测天数
